@@ -4,9 +4,12 @@ on:
   workflow_dispatch:
 
   schedule:
-    # Every day at 7:00 PM India Standard Time (IST)
+    # 7:00 PM India Standard Time (IST)
     # 19:00 IST = 13:30 UTC
     - cron: "30 13 * * *"
+
+permissions:
+  contents: read
 
 jobs:
   crawl:
@@ -40,4 +43,4 @@ jobs:
         if: success()
         run: |
           echo "Remote4.me crawler completed successfully."
-          echo "Next automatic run: tomorrow evening."
+          echo "Scheduled time: 7:00 PM IST."
