@@ -82,7 +82,7 @@ MAX_BOARDS_PER_RUN = 0
 # the next discovery refresh. This avoids carrying dead boards.
 MAX_BOARD_FAILURES = 3
 
-USER_AGENT = "Remote4.me Job Crawler/3.0"
+USER_AGENT = "Remote4.me Job Crawler/3.1"
 
 SMART_RETRY_STATUS_CODES = {
     408,
@@ -146,6 +146,13 @@ ATS_SOURCES = {
         ),
     },
 }
+
+
+# Runtime metadata discovered while validating/scanning boards.
+# These dictionaries let the Boards sheet preserve the exact ATS-hosted
+# domain when a company uses a regional ATS endpoint (for example Lever EU).
+DISCOVERED_BOARD_URLS = {}
+DISCOVERED_COMPANY_NAMES = {}
 
 
 # ============================================================
@@ -1629,6 +1636,15 @@ def discover_boards_for_ats(
             f"{len(found)} candidates"
         )
 
+        for slug in found:
+            key = (ats, slug)
+            # Prefer the first discovered domain. This preserves an EU Lever
+            # board URL when that is the domain where the board was found.
+            DISCOVERED_BOARD_URLS.setdefault(
+                key,
+                f"https://{domain}/{quote(str(slug), safe='')}"
+            )
+
         candidates.update(
             found
         )
@@ -1736,13 +1752,17 @@ def validate_workable(
         },
     )
 
-    return (
+    if not (
         isinstance(data, dict)
-        and isinstance(
-            data.get("jobs"),
-            list,
-        )
-    )
+        and isinstance(data.get("jobs"), list)
+    ):
+        return False
+
+    account_name = clean_text(data.get("name"))
+    if account_name:
+        DISCOVERED_COMPANY_NAMES[("workable", slug)] = account_name
+
+    return True
 
 
 def validate_board(
@@ -1852,9 +1872,14 @@ def validate_boards(
 # PERSISTENT BOARD CACHE
 # ============================================================
 
+# The Boards sheet is the permanent ATS/company registry.
+# Company is stored as a human-readable name and is hyperlinked to
+# the company's ATS-hosted board. Board Slug remains the stable key.
 BOARD_HEADERS = [
+    "Company",
     "ATS",
     "Board Slug",
+    "ATS Link",
     "Last Validated",
     "Failures",
     "Active",
@@ -1862,9 +1887,61 @@ BOARD_HEADERS = [
 ]
 
 
-def load_board_cache(
-    worksheet,
-):
+def humanize_company_slug(slug):
+    """Best-effort company display name when the ATS does not expose one."""
+    value = unquote(clean_text(slug))
+    value = re.sub(r"[_-]+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+
+    if not value:
+        return ""
+
+    # Keep obvious domain-style/company-brand punctuation readable.
+    if "." in value and " " not in value:
+        parts = value.split(".")
+        value = ".".join(
+            part[:1].upper() + part[1:]
+            if part else part
+            for part in parts
+        )
+        return value
+
+    # Preserve all-uppercase acronyms while title-casing ordinary slugs.
+    return " ".join(
+        part if part.isupper() else part[:1].upper() + part[1:]
+        for part in value.split()
+    )
+
+
+def ats_board_url(ats, slug):
+    """Return the stable public ATS-hosted company/board URL."""
+    encoded = quote(str(slug), safe="")
+
+    if ats == "greenhouse":
+        return f"https://job-boards.greenhouse.io/{encoded}"
+
+    if ats == "ashby":
+        return f"https://jobs.ashbyhq.com/{encoded}"
+
+    if ats == "lever":
+        return f"https://jobs.lever.co/{encoded}"
+
+    if ats == "workable":
+        return f"https://apply.workable.com/{encoded}/"
+
+    return ""
+
+
+def board_display_name(ats, slug, existing_name=""):
+    """Prefer an existing verified name; otherwise humanize the ATS slug."""
+    existing_name = clean_text(existing_name)
+    if existing_name:
+        return existing_name
+
+    return humanize_company_slug(slug)
+
+
+def load_board_cache(worksheet):
     cache = {}
 
     try:
@@ -1875,72 +1952,56 @@ def load_board_cache(
 
         headers = rows[0]
 
-        indexes = {
-            name: (
-                headers.index(name)
-                if name in headers
-                else -1
-            )
-            for name in BOARD_HEADERS
-        }
+        def idx(name):
+            try:
+                return headers.index(name)
+            except ValueError:
+                return -1
+
+        # Support both the new registry format and the previous format.
+        ats_i = idx("ATS")
+        slug_i = idx("Board Slug")
+        company_i = idx("Company")
+        validated_i = idx("Last Validated")
+        failures_i = idx("Failures")
+        active_i = idx("Active")
+        source_i = idx("Discovery Source")
+        link_i = idx("ATS Link")
+
+        if ats_i < 0 or slug_i < 0:
+            return cache
 
         for row in rows[1:]:
-
-            ats_i = indexes["ATS"]
-            slug_i = indexes[
-                "Board Slug"
-            ]
-
-            if (
-                ats_i < 0
-                or slug_i < 0
-                or len(row) <= max(
-                    ats_i,
-                    slug_i,
-                )
-            ):
+            if len(row) <= max(ats_i, slug_i):
                 continue
 
-            ats = clean_text(
-                row[ats_i]
-            ).lower()
-
-            slug = clean_text(
-                row[slug_i]
-            )
+            ats = clean_text(row[ats_i]).lower()
+            slug = clean_text(row[slug_i])
 
             if not ats or not slug:
                 continue
 
-            active_i = indexes[
-                "Active"
-            ]
+            active = True
+            if active_i >= 0 and len(row) > active_i:
+                active = clean_text(row[active_i]).lower() in {
+                    "yes",
+                    "true",
+                    "1",
+                }
 
-            active = (
-                row[active_i].lower()
-                == "yes"
-                if active_i >= 0
-                and len(row) > active_i
-                else True
-            )
-
-            if not active:
-                continue
-
-            validated_i = indexes[
-                "Last Validated"
-            ]
-
-            validated = (
-                row[validated_i]
-                if validated_i >= 0
-                and len(row) > validated_i
+            # Inactive boards stay in the sheet for history, but are not
+            # returned to the daily crawl set.
+            company = (
+                clean_text(row[company_i])
+                if company_i >= 0 and len(row) > company_i
                 else ""
             )
 
-            failures_i = indexes[
-                "Failures"
-            ]
+            validated = (
+                clean_text(row[validated_i])
+                if validated_i >= 0 and len(row) > validated_i
+                else ""
+            )
 
             try:
                 failures = int(
@@ -1948,61 +2009,61 @@ def load_board_cache(
                 ) if (
                     failures_i >= 0
                     and len(row) > failures_i
-                    and row[failures_i]
+                    and clean_text(row[failures_i])
                 ) else 0
             except Exception:
                 failures = 0
 
-            cache[
-                (ats, slug)
-            ] = {
+            source = (
+                clean_text(row[source_i])
+                if source_i >= 0 and len(row) > source_i
+                else ""
+            )
+
+            link = (
+                clean_text(row[link_i])
+                if link_i >= 0 and len(row) > link_i
+                else ""
+            )
+
+            cache[(ats, slug)] = {
                 "ats": ats,
                 "slug": slug,
+                "company": company,
+                "ats_link": link or ats_board_url(ats, slug),
                 "last_validated": validated,
                 "failures": failures,
-                "active": True,
+                "active": active,
+                "discovery_source": source or "Existing",
             }
 
     except Exception as exc:
-        print(
-            f"Could not load board cache: "
-            f"{exc}"
-        )
+        print(f"Could not load board cache: {exc}")
 
     return cache
 
 
-def board_cache_is_fresh(
-    cache,
-):
+def board_cache_is_fresh(cache):
     if not cache:
         return False
 
     cutoff = (
-        datetime.now(
-            timezone.utc
-        )
-        - timedelta(
-            days=BOARD_CACHE_DAYS
-        )
+        datetime.now(timezone.utc)
+        - timedelta(days=BOARD_CACHE_DAYS)
     )
 
     dates = []
 
     for item in cache.values():
+        if not item.get("active", True):
+            continue
 
-        value = item.get(
-            "last_validated",
-            "",
-        )
+        value = item.get("last_validated", "")
 
         try:
             dates.append(
                 datetime.fromisoformat(
-                    value.replace(
-                        "Z",
-                        "+00:00",
-                    )
+                    value.replace("Z", "+00:00")
                 )
             )
         except Exception:
@@ -2019,55 +2080,114 @@ def save_board_cache(
     boards,
     existing_cache=None,
     discovery_sources=None,
+    company_names=None,
+    ats_links=None,
 ):
-    """Merge live boards into the persistent Boards sheet.
+    """Merge live ATS boards into the permanent Boards registry.
 
-    Boards are keyed by (ATS, slug), so rediscovery never creates
-    duplicates. Existing boards are retained unless explicitly marked
-    inactive in the sheet.
+    Key:
+        (ATS, Board Slug)
+
+    The company name and ATS link are stored with every board. The company
+    cell is written as a Google Sheets HYPERLINK formula so clicking the
+    company opens the ATS-hosted company board directly.
     """
     existing_cache = existing_cache or {}
     discovery_sources = discovery_sources or {}
+    company_names = company_names or {}
+    ats_links = ats_links or {}
 
     today = datetime.now(timezone.utc).date().isoformat()
     merged = {}
 
-    # Keep existing active boards.
+    # Preserve all existing entries, including inactive historical entries.
     for key, item in existing_cache.items():
+        ats, slug = key
         merged[key] = {
-            "ats": item.get("ats", ""),
-            "slug": item.get("slug", ""),
+            "ats": ats,
+            "slug": slug,
+            "company": board_display_name(
+                ats,
+                slug,
+                item.get("company", ""),
+            ),
+            "ats_link": (
+                item.get("ats_link")
+                or ats_board_url(ats, slug)
+            ),
             "last_validated": item.get("last_validated", ""),
             "failures": item.get("failures", 0),
-            "active": True,
-            "discovery_source": item.get("discovery_source", "Existing"),
+            "active": item.get("active", True),
+            "discovery_source": item.get(
+                "discovery_source",
+                "Existing",
+            ),
         }
 
-    # Add/update boards confirmed by the ATS today.
+    # Confirmed boards become active and reset their failure counter.
     for ats, slugs in boards.items():
         for slug in slugs:
             key = (ats, slug)
             old = merged.get(key, {})
+
+            company = (
+                company_names.get(key)
+                or old.get("company")
+                or humanize_company_slug(slug)
+            )
+
+            link = (
+                ats_links.get(key)
+                or old.get("ats_link")
+                or ats_board_url(ats, slug)
+            )
+
             merged[key] = {
                 "ats": ats,
                 "slug": slug,
+                "company": board_display_name(
+                    ats,
+                    slug,
+                    company,
+                ),
+                "ats_link": link,
                 "last_validated": today,
                 "failures": 0,
                 "active": True,
                 "discovery_source": (
                     discovery_sources.get(key)
                     or old.get("discovery_source")
-                    or "Internet Archive"
+                    or "ATS"
                 ),
             }
 
     rows = [BOARD_HEADERS]
 
-    for key in sorted(merged, key=lambda x: (x[0].lower(), x[1].lower())):
+    for key in sorted(
+        merged,
+        key=lambda x: (x[0].lower(), x[1].lower()),
+    ):
         item = merged[key]
-        rows.append([
+        company = item["company"] or humanize_company_slug(item["slug"])
+        link = item["ats_link"] or ats_board_url(
             item["ats"],
             item["slug"],
+        )
+
+        # Formula is intentionally used only for the display-name cell.
+        # The raw ATS Link remains visible in its own column for easy copying.
+        company_formula = (
+            f'=HYPERLINK("{link.replace(chr(34), chr(34) * 2)}",'
+            f'"{company.replace(chr(34), chr(34) * 2)}")'
+            if link
+            else company
+        )
+
+        rows.append([
+            company_formula,
+            item["ats"],
+            item["slug"],
+            link,
             item["last_validated"],
             item["failures"],
             "Yes" if item["active"] else "No",
@@ -2079,10 +2199,11 @@ def save_board_cache(
         worksheet.update(
             "A1",
             rows,
-            value_input_option="RAW",
+            value_input_option="USER_ENTERED",
         )
         print(
-            f"Saved {len(rows) - 1} unique live boards to Boards sheet."
+            f"Saved {len(rows) - 1} unique boards to Boards sheet "
+            "with company names and ATS links."
         )
     except Exception as exc:
         print(f"Could not save board cache: {exc}")
@@ -2107,21 +2228,16 @@ def board_needs_revalidation(item):
 
 
 def discover_or_load_boards(spreadsheet):
-    """Run daily discovery, then use the ATS as the source of truth.
+    """Daily discovery + direct ATS validation + persistent board registry.
 
     Flow:
-      1. Load existing Boards.
-      2. Scan Internet Archive/Common Crawl every day for ATS board slugs.
-      3. Skip duplicate (ATS, slug) candidates already in Boards.
-      4. Validate new candidates directly against the ATS.
-      5. Revalidate old boards only when their validation is stale.
-      6. Merge confirmed boards into Boards without duplicating them.
+      1. Load the permanent Boards registry.
+      2. Scan Internet Archive/Common Crawl every day.
+      3. Skip duplicate (ATS, slug) candidates already known.
+      4. Validate new/stale candidates directly against the ATS.
+      5. Keep all previously active boards even if an archive misses them.
+      6. Save company name + ATS board URL in Boards.
       7. Return all active boards for the direct daily ATS job crawl.
-
-    There is intentionally no assumption that an ATS provides a global
-    company directory. Greenhouse/Ashby/Lever/Workable public APIs are
-    board-level APIs, so a board slug must first be discovered or already
-    known. Once known, the ATS itself is the authoritative source for jobs.
     """
     boards_sheet = get_or_create_worksheet(
         spreadsheet,
@@ -2133,11 +2249,10 @@ def discover_or_load_boards(spreadsheet):
     existing_cache = load_board_cache(boards_sheet)
     print(f"\nExisting unique Boards entries: {len(existing_cache)}")
 
-    # --------------------------------------------------------
-    # DAILY INTERNET ARCHIVE / COMMON CRAWL DISCOVERY
-    # --------------------------------------------------------
     discovered = {ats: set() for ats in ATS_SOURCES}
     discovery_sources = {}
+    company_names = {}
+    ats_links = {}
 
     print("\nDaily board discovery — Internet Archive first")
 
@@ -2148,61 +2263,84 @@ def discover_or_load_boards(spreadsheet):
         for slug in candidates:
             key = (ats, slug)
             discovery_sources[key] = "Internet Archive/Common Crawl"
+            ats_links[key] = (
+                DISCOVERED_BOARD_URLS.get(key)
+                or ats_board_url(ats, slug)
+            )
+            company_names[key] = (
+                DISCOVERED_COMPANY_NAMES.get(key)
+                or humanize_company_slug(slug)
+            )
 
-    # --------------------------------------------------------
-    # VALIDATE ONLY NEW / STALE BOARDS AGAINST THE ATS
-    # --------------------------------------------------------
     boards = {ats: set() for ats in ATS_SOURCES}
     candidates_to_validate = {ats: set() for ats in ATS_SOURCES}
 
     for ats in ATS_SOURCES:
         for slug in discovered[ats]:
             key = (ats, slug)
+
             if key not in existing_cache:
                 candidates_to_validate[ats].add(slug)
-            else:
-                # A board already in Boards is not a duplicate. It is
-                # still revalidated periodically to confirm it remains live.
-                if board_needs_revalidation(existing_cache[key]):
-                    candidates_to_validate[ats].add(slug)
-                else:
-                    boards[ats].add(slug)
+                continue
 
-    # Existing boards always remain in the daily crawl set.
-    # Internet Archive discovery is a discovery signal, not the source
-    # of truth for whether a previously known ATS board should be scanned.
-    # This prevents an archive miss from making a live company disappear.
-    for key, item in existing_cache.items():
-        ats, slug = key
+            # Existing boards are skipped as duplicates unless their ATS
+            # validation is stale. A stale board is rechecked, not duplicated.
+            if board_needs_revalidation(existing_cache[key]):
+                candidates_to_validate[ats].add(slug)
+            elif existing_cache[key].get("active", True):
+                boards[ats].add(slug)
+
+    # Existing active boards always remain in the daily crawl set. An archive
+    # miss must never make a known live company disappear.
+    for (ats, slug), item in existing_cache.items():
         if ats in boards and item.get("active", True):
             boards[ats].add(slug)
 
-    total_new_candidates = sum(
-        len(values) for values in candidates_to_validate.values()
+    total_candidates = sum(
+        len(values)
+        for values in candidates_to_validate.values()
     )
-    print(f"\nNew/stale board candidates requiring direct ATS validation: {total_new_candidates}")
+
+    print(
+        "\nNew/stale board candidates requiring direct ATS validation: "
+        f"{total_candidates}"
+    )
 
     for ats in ATS_SOURCES:
-        candidates = sorted(candidates_to_validate[ats], key=str.lower)
+        candidates = sorted(
+            candidates_to_validate[ats],
+            key=str.lower,
+        )
+
         if not candidates:
             continue
 
         valid = validate_boards(ats, candidates)
+
         for slug in valid:
+            key = (ats, slug)
             boards[ats].add(slug)
-            discovery_sources[(ats, slug)] = (
+            discovery_sources[key] = (
                 "Internet Archive/Common Crawl"
                 if slug in discovered[ats]
                 else "ATS"
             )
+            ats_links[key] = (
+                DISCOVERED_BOARD_URLS.get(key)
+                or ats_board_url(ats, slug)
+            )
+            company_names[key] = (
+                DISCOVERED_COMPANY_NAMES.get(key)
+                or humanize_company_slug(slug)
+            )
 
-    # Save merged unique board set. Existing boards are retained; only
-    # ATS-confirmed new boards are added.
     save_board_cache(
         boards_sheet,
         boards,
         existing_cache=existing_cache,
         discovery_sources=discovery_sources,
+        company_names=company_names,
+        ats_links=ats_links,
     )
 
     print("\nDirect ATS crawl will now scan every active board daily.")
@@ -3214,12 +3352,8 @@ def job_already_exists(
 # SAVE JOBS
 # ============================================================
 
-def ensure_job_headers(
-    worksheet,
-):
-    values = (
-        worksheet.get_all_values()
-    )
+def ensure_job_headers(worksheet):
+    values = worksheet.get_all_values()
 
     if not values:
         worksheet.update(
@@ -3229,15 +3363,59 @@ def ensure_job_headers(
         )
         return
 
-    headers = values[0]
+    headers = [clean_text(x) for x in values[0]]
 
     if headers == JOB_HEADERS:
         return
 
-    # If the user has an older 8-column sheet, convert it safely
-    # by inserting Date at the beginning while preserving the
-    # existing columns where possible.
-    if headers == [
+    # Older 8-column Date-first layout used by the sheet screenshot:
+    # Date | Company | Job Title | Location | Posted Date | Job Link | Job ID | ATS
+    # Insert Country without deleting any existing job data.
+    old_date_first = [
+        "Date",
+        "Company",
+        "Job Title",
+        "Location",
+        "Posted Date",
+        "Job Link",
+        "Job ID",
+        "ATS",
+    ]
+
+    if headers == old_date_first:
+        converted = [JOB_HEADERS]
+
+        for row in values[1:]:
+            padded = list(row)
+            while len(padded) < 8:
+                padded.append("")
+
+            converted.append([
+                padded[0],  # Date
+                padded[1],  # Company
+                padded[2],  # Job Title
+                padded[3],  # Location
+                "",        # Country was not present
+                padded[4],  # Posted Date
+                padded[5],  # Job Link
+                padded[6],  # Job ID
+                padded[7],  # ATS
+            ])
+
+        worksheet.clear()
+        worksheet.update(
+            "A1",
+            converted,
+            value_input_option="RAW",
+        )
+        print(
+            "Upgraded Jobs sheet: inserted missing Country column "
+            "while preserving existing rows."
+        )
+        return
+
+    # Previous 8-column layout from an older crawler version:
+    old_company_first = [
         "Company",
         "Job Title",
         "Location",
@@ -3246,58 +3424,45 @@ def ensure_job_headers(
         "Job Link",
         "ATS",
         "Job ID",
-    ]:
+    ]
 
-        today = (
-            datetime.now(
-                timezone.utc
-            ).date().isoformat()
-        )
-
-        converted = [
-            JOB_HEADERS
-        ]
+    if headers == old_company_first:
+        today = datetime.now(timezone.utc).date().isoformat()
+        converted = [JOB_HEADERS]
 
         for row in values[1:]:
             padded = list(row)
-
             while len(padded) < 8:
                 padded.append("")
 
-            converted.append(
-                [
-                    today,
-                    padded[0],
-                    padded[1],
-                    padded[2],
-                    padded[3],
-                    padded[4],
-                    padded[5],
-                    padded[7],
-                    padded[6],
-                ]
-            )
+            converted.append([
+                today,
+                padded[0],
+                padded[1],
+                padded[2],
+                padded[3],
+                padded[4],
+                padded[5],
+                padded[7],
+                padded[6],
+            ])
 
         worksheet.clear()
-
         worksheet.update(
             "A1",
             converted,
             value_input_option="RAW",
         )
-
         print(
-            "Converted old Jobs sheet "
-            "to the new Date-first format."
+            "Converted old Jobs sheet to the Date-first format."
         )
-
         return
 
+    # If the user has a custom header, do not destroy their data.
+    # save_jobs will still use named-column lookup where possible.
     print(
-        "Existing Jobs header is custom. "
-        "The crawler will preserve existing "
-        "columns and append only if the required "
-        "columns can be identified."
+        "Existing Jobs header is custom; preserving it. "
+        "No destructive header rewrite was performed."
     )
 
 
