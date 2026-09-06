@@ -1,0 +1,32 @@
+name: Remote4.me Job Crawler
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # Every day at 08:00 IST
+    - cron: "30 2 * * *"
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install requests gspread google-auth
+
+      - name: Run Remote4.me crawler
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: |
+          python crawler.py
