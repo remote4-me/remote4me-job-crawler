@@ -17,25 +17,32 @@ from google.oauth2.service_account import Credentials
 # ============================================================
 #
 # Purpose:
-#   Discover public ATS boards and collect relevant remote jobs.
+#   Automatically discover public ATS boards and collect
+#   relevant REMOTE jobs for Remote4.me.
 #
-# Current niche:
+# Focus:
 #   Customer Support
 #   Technical Support
 #   Customer Success
 #
-# Current countries:
+# Countries:
 #   India
 #   USA
 #
-# Supported ATS:
+# ATS:
 #   Greenhouse
 #   Ashby
 #   Lever
 #   Workable
-#   SmartRecruiters
 #
-# Runs automatically through GitHub Actions.
+# Important:
+#   - SmartRecruiters has been removed.
+#   - Only remote jobs are accepted.
+#   - Only India/USA jobs are accepted.
+#   - Jobs older than MAX_JOB_AGE_DAYS are skipped.
+#   - Jobs already present in Google Sheets are skipped.
+#   - Added Date is written as the first column.
+#
 # ============================================================
 
 
@@ -43,29 +50,40 @@ from google.oauth2.service_account import Credentials
 # CONFIGURATION
 # ============================================================
 
-SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
-GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
+SPREADSHEET_ID = os.environ.get(
+    "SPREADSHEET_ID",
+    "",
+)
 
-# Maximum concurrent HTTP requests.
-# 8 is intentionally moderate for public ATS endpoints.
+GOOGLE_CREDENTIALS = os.environ.get(
+    "GOOGLE_CREDENTIALS",
+    "",
+)
+
+# Moderate concurrency for public ATS endpoints.
 CONCURRENCY = 8
 
-# Keep jobs whose ATS publication date is within this window.
-# If an ATS does not expose a date in its list endpoint, the job
-# is allowed because it is currently returned as an active posting.
-MAX_JOB_AGE_DAYS = 30
+# IMPORTANT:
+# Your first crawl produced ~11,000 jobs because 30 days
+# was being scanned across thousands of boards.
+#
+# With a daily crawler, 7 days is a much more practical window.
+MAX_JOB_AGE_DAYS = 7
 
-# 0 = all discovered live boards.
+# 0 = crawl every discovered live board.
 MAX_BOARDS_PER_RUN = 0
 
-# Board discovery is refreshed every run.
+# Refresh board discovery every run.
 REFRESH_BOARDS = True
 
-# SmartRecruiters max page size is 100.
-SMARTRECRUITERS_PAGE_SIZE = 100
+# Google Sheet tab.
+JOBS_SHEET_NAME = "Jobs"
 
-# User agent for public ATS endpoints.
-USER_AGENT = "Remote4.me Job Crawler/2.0"
+# Date format used in the Added Date column.
+DATE_FORMAT = "%Y-%m-%d"
+
+# Public HTTP user agent.
+USER_AGENT = "Remote4.me Job Crawler/3.0"
 
 
 # ============================================================
@@ -78,48 +96,67 @@ ATS_SOURCES = {
             "boards.greenhouse.io",
             "job-boards.greenhouse.io",
         ],
-        "api": "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs",
+        "api": (
+            "https://boards-api.greenhouse.io/"
+            "v1/boards/{slug}/jobs"
+        ),
     },
 
     "ashby": {
         "archive_domains": [
             "jobs.ashbyhq.com",
         ],
-        "api": "https://api.ashbyhq.com/posting-api/job-board/{slug}",
+        "api": (
+            "https://api.ashbyhq.com/"
+            "posting-api/job-board/{slug}"
+        ),
     },
 
     "lever": {
         "archive_domains": [
             "jobs.lever.co",
         ],
-        "api": "https://api.lever.co/v0/postings/{slug}?mode=json",
+        "api": (
+            "https://api.lever.co/"
+            "v0/postings/{slug}?mode=json"
+        ),
     },
 
     "workable": {
         "archive_domains": [
             "apply.workable.com",
         ],
-        "api": "https://www.workable.com/api/accounts/{slug}",
-    },
-
-    "smartrecruiters": {
-        "archive_domains": [
-            "careers.smartrecruiters.com",
-        ],
-        "api": "https://api.smartrecruiters.com/v1/companies/{slug}/postings",
+        "api": (
+            "https://www.workable.com/"
+            "api/accounts/{slug}"
+        ),
     },
 }
 
 
 # ============================================================
-# REMOTE4.ME TARGET KEYWORDS
+# TARGET JOB TITLES
+# ============================================================
+#
+# These are intentionally title-based.
+#
+# We do NOT use standalone words such as:
+#   support
+#   success
+#   manager
+#   specialist
+#   operations
+#
+# because those create too much unrelated content.
+#
 # ============================================================
 
 TARGET_TITLE_PATTERNS = [
 
-    # ----------------------------
-    # Customer Support
-    # ----------------------------
+    # --------------------------------------------------------
+    # CUSTOMER SUPPORT
+    # --------------------------------------------------------
+
     r"\bcustomer support\b",
     r"\bcustomer support specialist\b",
     r"\bcustomer support associate\b",
@@ -127,8 +164,8 @@ TARGET_TITLE_PATTERNS = [
     r"\bcustomer support agent\b",
     r"\bcustomer service\b",
     r"\bcustomer service specialist\b",
-    r"\bcustomer service representative\b",
     r"\bcustomer service associate\b",
+    r"\bcustomer service representative\b",
     r"\bcustomer service agent\b",
     r"\bcustomer care\b",
     r"\bcustomer care specialist\b",
@@ -139,6 +176,7 @@ TARGET_TITLE_PATTERNS = [
     r"\bcustomer experience representative\b",
     r"\bclient support\b",
     r"\bclient support specialist\b",
+    r"\bclient support associate\b",
     r"\bclient support representative\b",
     r"\bclient services\b",
     r"\bclient service\b",
@@ -164,9 +202,10 @@ TARGET_TITLE_PATTERNS = [
     r"\bclient operations\b",
     r"\bclient operations specialist\b",
 
-    # ----------------------------
-    # Technical Support
-    # ----------------------------
+    # --------------------------------------------------------
+    # TECHNICAL SUPPORT
+    # --------------------------------------------------------
+
     r"\btechnical support\b",
     r"\btechnical support specialist\b",
     r"\btechnical support associate\b",
@@ -211,9 +250,10 @@ TARGET_TITLE_PATTERNS = [
     r"\btechnical success\b",
     r"\btechnical customer success\b",
 
-    # ----------------------------
-    # Customer Success
-    # ----------------------------
+    # --------------------------------------------------------
+    # CUSTOMER SUCCESS
+    # --------------------------------------------------------
+
     r"\bcustomer success\b",
     r"\bcustomer success specialist\b",
     r"\bcustomer success associate\b",
@@ -250,10 +290,10 @@ TARGET_TITLE_PATTERNS = [
     r"\bcustomer education\b",
     r"\bcustomer advocacy\b",
     r"\bcustomer experience manager\b",
-    r"\bcustomer experience specialist\b",
     r"\bclient experience\b",
     r"\bclient experience specialist\b",
 ]
+
 
 TITLE_REGEX = re.compile(
     "|".join(TARGET_TITLE_PATTERNS),
@@ -262,10 +302,10 @@ TITLE_REGEX = re.compile(
 
 
 # ============================================================
-# METADATA KEYWORDS
+# ATS METADATA MATCHING
 # ============================================================
 
-SUPPORT_METADATA_PATTERNS = [
+RELEVANT_METADATA_PATTERNS = [
     r"\bcustomer support\b",
     r"\bcustomer service\b",
     r"\bcustomer care\b",
@@ -274,7 +314,6 @@ SUPPORT_METADATA_PATTERNS = [
     r"\bclient service\b",
     r"\bmember support\b",
     r"\buser support\b",
-    r"\bsupport\b",
     r"\btechnical support\b",
     r"\bproduct support\b",
     r"\bapplication support\b",
@@ -283,9 +322,6 @@ SUPPORT_METADATA_PATTERNS = [
     r"\bhelp desk\b",
     r"\bhelpdesk\b",
     r"\bservice desk\b",
-]
-
-SUCCESS_METADATA_PATTERNS = [
     r"\bcustomer success\b",
     r"\bclient success\b",
     r"\bcustomer onboarding\b",
@@ -297,21 +333,39 @@ SUCCESS_METADATA_PATTERNS = [
     r"\bcustomer advocacy\b",
 ]
 
+
 METADATA_REGEX = re.compile(
-    "|".join(
-        SUPPORT_METADATA_PATTERNS
-        + SUCCESS_METADATA_PATTERNS
-    ),
+    "|".join(RELEVANT_METADATA_PATTERNS),
+    re.IGNORECASE,
+)
+
+
+GENERIC_ROLE_REGEX = re.compile(
+    r"\b("
+    r"specialist|"
+    r"associate|"
+    r"representative|"
+    r"advisor|"
+    r"agent|"
+    r"analyst|"
+    r"coordinator|"
+    r"consultant|"
+    r"executive|"
+    r"engineer|"
+    r"manager"
+    r")\b",
     re.IGNORECASE,
 )
 
 
 # ============================================================
-# LOCATION KEYWORDS
+# LOCATION PATTERNS
 # ============================================================
 
 INDIA_PATTERNS = [
     r"\bindia\b",
+    r"\bindian\b",
+    r"\bin\b",
     r"\bbengaluru\b",
     r"\bbangalore\b",
     r"\bhyderabad\b",
@@ -329,64 +383,39 @@ INDIA_PATTERNS = [
     r"\bkerala\b",
     r"\bjaipur\b",
     r"\bchandigarh\b",
-    r"\bindian\b",
 ]
+
 
 USA_PATTERNS = [
     r"\bunited states\b",
+    r"\bunited states of america\b",
     r"\busa\b",
     r"\bu\.s\.\b",
-    r"\bunited states of america\b",
-    r"\balabama\b",
-    r"\balaska\b",
-    r"\barizona\b",
-    r"\barkansas\b",
+    r"\bunited states \(us\)\b",
     r"\bcalifornia\b",
-    r"\bcolorado\b",
-    r"\bconnecticut\b",
-    r"\bdelaware\b",
+    r"\btexas\b",
+    r"\bnew york\b",
     r"\bflorida\b",
-    r"\bgeorgia\b",
-    r"\bhawaii\b",
-    r"\bidaho\b",
+    r"\bwashington\b",
     r"\billinois\b",
-    r"\bindiana\b",
-    r"\biowa\b",
-    r"\bkansas\b",
-    r"\bkentucky\b",
-    r"\blouisiana\b",
-    r"\bmaine\b",
-    r"\bmaryland\b",
     r"\bmassachusetts\b",
+    r"\bcolorado\b",
+    r"\bgeorgia\b",
+    r"\barizona\b",
+    r"\bvirginia\b",
+    r"\bnorth carolina\b",
+    r"\bnew jersey\b",
+    r"\bpennsylvania\b",
+    r"\bohio\b",
     r"\bmichigan\b",
     r"\bminnesota\b",
-    r"\bmississippi\b",
-    r"\bmissouri\b",
-    r"\bmontana\b",
-    r"\bnebraska\b",
-    r"\bnevada\b",
-    r"\bnew hampshire\b",
-    r"\bnew jersey\b",
-    r"\bnew mexico\b",
-    r"\bnew york\b",
-    r"\bnorth carolina\b",
-    r"\bnorth dakota\b",
-    r"\bohio\b",
-    r"\boklahoma\b",
-    r"\boregon\b",
-    r"\bpennsylvania\b",
-    r"\brhode island\b",
-    r"\bsouth carolina\b",
-    r"\bsouth dakota\b",
     r"\btennessee\b",
-    r"\btexas\b",
+    r"\boregon\b",
+    r"\bconnecticut\b",
+    r"\bmaryland\b",
+    r"\bnevada\b",
     r"\butah\b",
-    r"\bvermont\b",
-    r"\bvirginia\b",
-    r"\bwashington\b",
-    r"\bwest virginia\b",
     r"\bwisconsin\b",
-    r"\bwyoming\b",
     r"\baustin\b",
     r"\bseattle\b",
     r"\bboston\b",
@@ -407,12 +436,16 @@ USA_PATTERNS = [
     r"\bwashington d\.c\.\b",
 ]
 
+
 REMOTE_PATTERNS = [
     r"\bremote\b",
     r"\bwork from home\b",
+    r"\bwork-from-home\b",
+    r"\bhome based\b",
+    r"\bhome-based\b",
     r"\bdistributed\b",
-    r"\bhome[- ]based\b",
 ]
+
 
 INDIA_REGEX = re.compile(
     "|".join(INDIA_PATTERNS),
@@ -473,7 +506,9 @@ def get_google_sheet():
         )
     )
 
-    client = gspread.authorize(credentials)
+    client = gspread.authorize(
+        credentials
+    )
 
     spreadsheet = client.open_by_key(
         SPREADSHEET_ID
@@ -481,20 +516,21 @@ def get_google_sheet():
 
     try:
         worksheet = spreadsheet.worksheet(
-            "Jobs"
+            JOBS_SHEET_NAME
         )
+
     except gspread.WorksheetNotFound:
         worksheet = spreadsheet.add_worksheet(
-            title="Jobs",
+            title=JOBS_SHEET_NAME,
             rows=1000,
-            cols=10,
+            cols=9,
         )
 
     return worksheet
 
 
 # ============================================================
-# HELPERS
+# GENERAL HELPERS
 # ============================================================
 
 def clean_text(value):
@@ -527,16 +563,35 @@ def normalize_url(url):
     try:
         parsed = urlparse(url)
 
+        if not parsed.scheme or not parsed.netloc:
+            return url.rstrip("/")
+
         clean = (
-            f"{parsed.scheme}://"
-            f"{parsed.netloc}"
-            f"{parsed.path}"
+            f"{parsed.scheme.lower()}://"
+            f"{parsed.netloc.lower()}"
+            f"{parsed.path.rstrip('/')}"
         )
 
-        return clean.rstrip("/")
+        return clean
 
     except Exception:
         return url.rstrip("/")
+
+
+def normalize_for_duplicate(value):
+    value = clean_text(value).lower()
+
+    value = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        value,
+    )
+
+    return re.sub(
+        r"\s+",
+        " ",
+        value,
+    ).strip()
 
 
 def make_job_key(
@@ -545,12 +600,50 @@ def make_job_key(
     url,
 ):
     if job_id:
-        raw = f"{ats}:{job_id}"
+        raw = (
+            f"{ats.lower()}:"
+            f"{str(job_id).strip()}"
+        )
+
     else:
         raw = (
-            f"{ats}:"
-            f"{normalize_url(url)}"
+            f"url:"
+            f"{normalize_url(url).lower()}"
         )
+
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()
+
+
+def make_fallback_job_key(
+    job,
+):
+    """
+    Secondary duplicate protection.
+
+    This catches the same posting if the ATS returns it
+    without a stable job ID but with the same company,
+    title and location.
+    """
+
+    company = normalize_for_duplicate(
+        job.get("company")
+    )
+
+    title = normalize_for_duplicate(
+        job.get("title")
+    )
+
+    location = normalize_for_duplicate(
+        job.get("location")
+    )
+
+    raw = (
+        f"{company}|"
+        f"{title}|"
+        f"{location}"
+    )
 
     return hashlib.sha256(
         raw.encode("utf-8")
@@ -608,8 +701,8 @@ def request_json(
     params=None,
 ):
     """
-    GET JSON with a small retry policy for temporary
-    429/5xx responses.
+    GET JSON with limited retries for temporary
+    rate limits and server errors.
     """
 
     for attempt in range(3):
@@ -631,6 +724,7 @@ def request_json(
                 503,
                 504,
             ):
+
                 if attempt < 2:
                     time.sleep(
                         1.5 * (attempt + 1)
@@ -657,23 +751,29 @@ def request_json(
 # ============================================================
 
 def is_target_title(title):
+    title = clean_text(title)
+
     if not title:
         return False
 
     return bool(
-        TITLE_REGEX.search(
-            clean_text(title)
-        )
+        TITLE_REGEX.search(title)
     )
 
 
-def has_relevant_metadata(metadata):
+def has_relevant_metadata(
+    metadata,
+):
+    metadata = clean_text(
+        metadata
+    )
+
     if not metadata:
         return False
 
     return bool(
         METADATA_REGEX.search(
-            clean_text(metadata)
+            metadata
         )
     )
 
@@ -683,32 +783,23 @@ def is_relevant_job(
     metadata="",
 ):
     """
-    Primary signal is the title.
+    Title is the primary signal.
 
-    Metadata is accepted only when the title is a short,
-    role-like word such as Specialist/Associate/Representative
-    and the ATS itself classifies it as Support/Success/etc.
+    Metadata can rescue a generic role title only when
+    the ATS department/team/function explicitly identifies
+    it as Support/Success/Onboarding/Implementation/etc.
     """
 
     title = clean_text(title)
-    metadata = clean_text(metadata)
 
     if is_target_title(title):
         return True
 
-    generic_role = re.search(
-        r"\b("
-        r"specialist|associate|representative|"
-        r"advisor|agent|analyst|coordinator|"
-        r"consultant|executive|engineer|"
-        r"manager"
-        r")\b",
-        title,
-        re.IGNORECASE,
-    )
-
-    if generic_role and has_relevant_metadata(
-        metadata
+    if (
+        GENERIC_ROLE_REGEX.search(title)
+        and has_relevant_metadata(
+            metadata
+        )
     ):
         return True
 
@@ -716,45 +807,123 @@ def is_relevant_job(
 
 
 # ============================================================
-# LOCATION CLASSIFICATION
+# REMOTE + COUNTRY CLASSIFICATION
 # ============================================================
 
-def classify_location(
+def classify_country(
     location,
-    remote=False,
     country_code="",
 ):
-    location = clean_text(location)
+    location = clean_text(
+        location
+    )
 
     code = clean_text(
         country_code
     ).upper()
 
-    if code == "IN":
+    # Explicit country codes first.
+    if code in (
+        "IN",
+        "IND",
+        "INDIA",
+    ):
         return "India"
 
-    if code == "US":
+    if code in (
+        "US",
+        "USA",
+        "UNITED STATES",
+    ):
         return "USA"
 
-    if INDIA_REGEX.search(location):
+    if INDIA_REGEX.search(
+        location
+    ):
         return "India"
 
-    if USA_REGEX.search(location):
+    if USA_REGEX.search(
+        location
+    ):
         return "USA"
-
-    # Worldwide/global remote jobs are intentionally rejected
-    # unless India or USA is explicitly stated.
-    if remote or REMOTE_REGEX.search(location):
-        return ""
 
     return ""
+
+
+def is_remote_job(
+    location,
+    remote=False,
+    workplace_type="",
+):
+    location = clean_text(
+        location
+    )
+
+    workplace_type = clean_text(
+        workplace_type
+    ).lower()
+
+    if remote is True:
+        return True
+
+    if workplace_type in (
+        "remote",
+        "fully remote",
+        "work from home",
+    ):
+        return True
+
+    if REMOTE_REGEX.search(
+        location
+    ):
+        return True
+
+    return False
+
+
+def classify_job_location(
+    location,
+    remote=False,
+    country_code="",
+    workplace_type="",
+):
+    """
+    Returns:
+        (country, is_remote)
+
+    Only India/USA + remote are accepted.
+    """
+
+    remote_ok = is_remote_job(
+        location,
+        remote,
+        workplace_type,
+    )
+
+    if not remote_ok:
+        return "", False
+
+    country = classify_country(
+        location,
+        country_code,
+    )
+
+    if country not in (
+        "India",
+        "USA",
+    ):
+        return "", False
+
+    return country, True
 
 
 # ============================================================
 # DATE FILTER
 # ============================================================
 
-def is_recent(posted_date):
+def is_recent(
+    posted_date,
+):
     if not posted_date:
         return True
 
@@ -765,7 +934,9 @@ def is_recent(posted_date):
         ).date()
 
         cutoff = (
-            datetime.now(timezone.utc).date()
+            datetime.now(
+                timezone.utc
+            ).date()
             - timedelta(
                 days=MAX_JOB_AGE_DAYS
             )
@@ -778,7 +949,7 @@ def is_recent(posted_date):
 
 
 # ============================================================
-# ATS BOARD DISCOVERY
+# WAYBACK BOARD DISCOVERY
 # ============================================================
 
 def extract_slug_from_url(
@@ -786,7 +957,9 @@ def extract_slug_from_url(
     domain,
 ):
     try:
-        parsed = urlparse(url)
+        parsed = urlparse(
+            url
+        )
 
         hostname = (
             parsed.netloc
@@ -794,10 +967,14 @@ def extract_slug_from_url(
             .split(":")[0]
         )
 
-        if hostname != domain.lower():
+        if hostname != (
+            domain.lower()
+        ):
             return None
 
-        path = parsed.path.strip("/")
+        path = parsed.path.strip(
+            "/"
+        )
 
         if not path:
             return None
@@ -830,7 +1007,10 @@ def extract_slug_from_url(
         if slug.lower() in blocked:
             return None
 
-        if len(slug) < 2 or len(slug) > 150:
+        if (
+            len(slug) < 2
+            or len(slug) > 150
+        ):
             return None
 
         return slug
@@ -843,7 +1023,8 @@ def discover_from_wayback(
     domain,
 ):
     """
-    Discover candidate board slugs from Internet Archive CDX.
+    Discover candidate company/board slugs from
+    Internet Archive CDX.
     """
 
     candidates = set()
@@ -870,6 +1051,7 @@ def discover_from_wayback(
                 f"{response.status_code} "
                 f"for {domain}"
             )
+
             return candidates
 
         data = response.json()
@@ -880,13 +1062,16 @@ def discover_from_wayback(
                 item,
                 list,
             ):
+
                 if not item:
                     continue
 
                 original = item[0]
 
             else:
-                original = str(item)
+                original = str(
+                    item
+                )
 
             slug = extract_slug_from_url(
                 original,
@@ -894,7 +1079,9 @@ def discover_from_wayback(
             )
 
             if slug:
-                candidates.add(slug)
+                candidates.add(
+                    slug
+                )
 
     except Exception as exc:
         print(
@@ -908,7 +1095,9 @@ def discover_from_wayback(
 def discover_boards_for_ats(
     ats,
 ):
-    source = ATS_SOURCES[ats]
+    source = ATS_SOURCES[
+        ats
+    ]
 
     all_candidates = set()
 
@@ -951,9 +1140,13 @@ def validate_generic_board(
     ats,
     slug,
 ):
-    source = ATS_SOURCES[ats]
+    source = ATS_SOURCES[
+        ats
+    ]
 
-    url = source["api"].format(
+    url = source[
+        "api"
+    ].format(
         slug=slug
     )
 
@@ -972,6 +1165,7 @@ def validate_generic_board(
             405,
             429,
         ):
+
             response = SESSION.get(
                 url,
                 timeout=20,
@@ -992,16 +1186,17 @@ def validate_generic_board(
 def validate_workable_board(
     slug,
 ):
-    url = (
-        ATS_SOURCES["workable"]["api"]
-        .format(slug=slug)
+    url = ATS_SOURCES[
+        "workable"
+    ]["api"].format(
+        slug=slug
     )
 
     data = request_json(
         url,
         timeout=20,
         params={
-            "details": "false"
+            "details": "false",
         },
     )
 
@@ -1017,55 +1212,12 @@ def validate_workable_board(
     )
 
 
-def validate_smartrecruiters_board(
-    slug,
-):
-    url = (
-        ATS_SOURCES[
-            "smartrecruiters"
-        ]["api"]
-        .format(slug=slug)
-    )
-
-    data = request_json(
-        url,
-        timeout=20,
-        params={
-            "limit": 1,
-            "offset": 0,
-            "destination": "PUBLIC",
-        },
-    )
-
-    if not isinstance(
-        data,
-        dict,
-    ):
-        return False
-
-    try:
-        return int(
-            data.get(
-                "totalFound",
-                0,
-            )
-        ) > 0
-
-    except Exception:
-        return False
-
-
 def validate_board(
     ats,
     slug,
 ):
     if ats == "workable":
         return validate_workable_board(
-            slug
-        )
-
-    if ats == "smartrecruiters":
-        return validate_smartrecruiters_board(
             slug
         )
 
@@ -1115,6 +1267,7 @@ def validate_boards(
             ]
 
             try:
+
                 if future.result():
                     valid.append(
                         slug
@@ -1144,17 +1297,16 @@ def validate_boards(
 
 
 # ============================================================
-# JOB FETCHERS
+# GREENHOUSE
 # ============================================================
 
 def fetch_greenhouse(
     slug,
 ):
-    url = (
-        ATS_SOURCES[
-            "greenhouse"
-        ]["api"]
-        .format(slug=slug)
+    url = ATS_SOURCES[
+        "greenhouse"
+    ]["api"].format(
+        slug=slug
     )
 
     data = request_json(
@@ -1192,7 +1344,9 @@ def fetch_greenhouse(
         )
 
         location = clean_text(
-            location_obj.get("name")
+            location_obj.get(
+                "name"
+            )
         )
 
         remote = bool(
@@ -1201,15 +1355,14 @@ def fetch_greenhouse(
             )
         )
 
-        country = classify_location(
-            location,
-            remote,
+        country, remote_ok = (
+            classify_job_location(
+                location,
+                remote=remote,
+            )
         )
 
-        if country not in (
-            "India",
-            "USA",
-        ):
+        if not remote_ok:
             continue
 
         posted = parse_date(
@@ -1232,7 +1385,9 @@ def fetch_greenhouse(
         )
 
         link = (
-            job.get("absolute_url")
+            job.get(
+                "absolute_url"
+            )
             or ""
         )
 
@@ -1253,14 +1408,17 @@ def fetch_greenhouse(
     return results
 
 
+# ============================================================
+# ASHBY
+# ============================================================
+
 def fetch_ashby(
     slug,
 ):
-    url = (
-        ATS_SOURCES[
-            "ashby"
-        ]["api"]
-        .format(slug=slug)
+    url = ATS_SOURCES[
+        "ashby"
+    ]["api"].format(
+        slug=slug
     )
 
     data = request_json(
@@ -1295,7 +1453,9 @@ def fetch_ashby(
 
         metadata = " ".join([
             clean_text(
-                job.get("department")
+                job.get(
+                    "department"
+                )
             ),
             clean_text(
                 job.get("team")
@@ -1332,13 +1492,16 @@ def fetch_ashby(
                 secondary,
                 dict,
             ):
+
                 loc = secondary.get(
                     "location"
                 )
 
                 if loc:
                     locations.append(
-                        clean_text(loc)
+                        clean_text(
+                            loc
+                        )
                     )
 
         location = ", ".join(
@@ -1354,15 +1517,21 @@ def fetch_ashby(
             )
         )
 
-        country = classify_location(
-            location,
-            remote,
+        workplace_type = clean_text(
+            job.get(
+                "workplaceType"
+            )
         )
 
-        if country not in (
-            "India",
-            "USA",
-        ):
+        country, remote_ok = (
+            classify_job_location(
+                location,
+                remote=remote,
+                workplace_type=workplace_type,
+            )
+        )
+
+        if not remote_ok:
             continue
 
         posted = parse_date(
@@ -1405,14 +1574,17 @@ def fetch_ashby(
     return results
 
 
+# ============================================================
+# LEVER
+# ============================================================
+
 def fetch_lever(
     slug,
 ):
-    url = (
-        ATS_SOURCES[
-            "lever"
-        ]["api"]
-        .format(slug=slug)
+    url = ATS_SOURCES[
+        "lever"
+    ]["api"].format(
+        slug=slug
     )
 
     data = request_json(
@@ -1435,7 +1607,9 @@ def fetch_lever(
         )
 
         categories = (
-            job.get("categories")
+            job.get(
+                "categories"
+            )
             or {}
         )
 
@@ -1465,7 +1639,9 @@ def fetch_lever(
         )
 
         country_code = clean_text(
-            job.get("country")
+            job.get(
+                "country"
+            )
         )
 
         workplace = clean_text(
@@ -1476,7 +1652,10 @@ def fetch_lever(
 
         remote = (
             workplace.lower()
-            == "remote"
+            in (
+                "remote",
+                "fully remote",
+            )
             or bool(
                 REMOTE_REGEX.search(
                     location
@@ -1484,16 +1663,16 @@ def fetch_lever(
             )
         )
 
-        country = classify_location(
-            location,
-            remote,
-            country_code,
+        country, remote_ok = (
+            classify_job_location(
+                location,
+                remote=remote,
+                country_code=country_code,
+                workplace_type=workplace,
+            )
         )
 
-        if country not in (
-            "India",
-            "USA",
-        ):
+        if not remote_ok:
             continue
 
         posted = parse_date(
@@ -1519,8 +1698,12 @@ def fetch_lever(
 
         link = (
             urls.get("show")
-            or job.get("hostedUrl")
-            or job.get("applyUrl")
+            or job.get(
+                "hostedUrl"
+            )
+            or job.get(
+                "applyUrl"
+            )
             or ""
         )
 
@@ -1541,21 +1724,24 @@ def fetch_lever(
     return results
 
 
+# ============================================================
+# WORKABLE
+# ============================================================
+
 def fetch_workable(
     slug,
 ):
-    url = (
-        ATS_SOURCES[
-            "workable"
-        ]["api"]
-        .format(slug=slug)
+    url = ATS_SOURCES[
+        "workable"
+    ]["api"].format(
+        slug=slug
     )
 
     data = request_json(
         url,
         timeout=30,
         params={
-            "details": "false"
+            "details": "false",
         },
     )
 
@@ -1580,10 +1766,14 @@ def fetch_workable(
 
         metadata = " ".join([
             clean_text(
-                job.get("department")
+                job.get(
+                    "department"
+                )
             ),
             clean_text(
-                job.get("function")
+                job.get(
+                    "function"
+                )
             ),
         ])
 
@@ -1594,15 +1784,21 @@ def fetch_workable(
             continue
 
         country_code = clean_text(
-            job.get("country")
+            job.get(
+                "country"
+            )
         )
 
         state = clean_text(
-            job.get("state")
+            job.get(
+                "state"
+            )
         )
 
         city = clean_text(
-            job.get("city")
+            job.get(
+                "city"
+            )
         )
 
         location_parts = [
@@ -1613,7 +1809,8 @@ def fetch_workable(
 
         location = ", ".join(
             dict.fromkeys(
-                x for x in location_parts
+                x
+                for x in location_parts
                 if x
             )
         )
@@ -1624,32 +1821,29 @@ def fetch_workable(
             )
         )
 
-        remote = (
-            bool(
-                job.get(
-                    "telecommuting",
-                    False,
-                )
+        remote = bool(
+            job.get(
+                "telecommuting",
+                False,
             )
-            or workplace_type.lower()
+        )
+
+        if (
+            workplace_type.lower()
             == "remote"
-            or bool(
-                REMOTE_REGEX.search(
-                    location
-                )
+        ):
+            remote = True
+
+        country, remote_ok = (
+            classify_job_location(
+                location,
+                remote=remote,
+                country_code=country_code,
+                workplace_type=workplace_type,
             )
         )
 
-        country = classify_location(
-            location,
-            remote,
-            country_code,
-        )
-
-        if country not in (
-            "India",
-            "USA",
-        ):
+        if not remote_ok:
             continue
 
         posted = parse_date(
@@ -1673,9 +1867,15 @@ def fetch_workable(
         )
 
         link = (
-            job.get("application_url")
-            or job.get("url")
-            or job.get("shortlink")
+            job.get(
+                "application_url"
+            )
+            or job.get(
+                "url"
+            )
+            or job.get(
+                "shortlink"
+            )
             or ""
         )
 
@@ -1696,225 +1896,16 @@ def fetch_workable(
     return results
 
 
-def fetch_smartrecruiters(
-    slug,
-):
-    url = (
-        ATS_SOURCES[
-            "smartrecruiters"
-        ]["api"]
-        .format(slug=slug)
-    )
-
-    results = []
-
-    offset = 0
-    total_found = None
-
-    while True:
-
-        data = request_json(
-            url,
-            timeout=30,
-            params={
-                "limit": SMARTRECRUITERS_PAGE_SIZE,
-                "offset": offset,
-                "destination": "PUBLIC",
-            },
-        )
-
-        if not isinstance(
-            data,
-            dict,
-        ):
-            break
-
-        content = data.get(
-            "content",
-            [],
-        )
-
-        if not isinstance(
-            content,
-            list,
-        ):
-            break
-
-        try:
-            total_found = int(
-                data.get(
-                    "totalFound",
-                    0,
-                )
-            )
-        except Exception:
-            total_found = None
-
-        if not content:
-            break
-
-        for job in content:
-
-            title = clean_text(
-                job.get("name")
-                or job.get("title")
-            )
-
-            location_obj = (
-                job.get("location")
-                or {}
-            )
-
-            city = clean_text(
-                location_obj.get(
-                    "city"
-                )
-            )
-
-            region = clean_text(
-                location_obj.get(
-                    "region"
-                )
-            )
-
-            country_code = clean_text(
-                location_obj.get(
-                    "country"
-                )
-            )
-
-            remote_flag = bool(
-                location_obj.get(
-                    "remote",
-                    False,
-                )
-            )
-
-            location_parts = [
-                city,
-                region,
-                country_code.upper()
-                if country_code
-                else "",
-            ]
-
-            if remote_flag:
-                location_parts.insert(
-                    0,
-                    "Remote",
-                )
-
-            location = ", ".join(
-                dict.fromkeys(
-                    x for x in location_parts
-                    if x
-                )
-            )
-
-            department_obj = (
-                job.get("department")
-                or {}
-            )
-
-            function_obj = (
-                job.get("function")
-                or {}
-            )
-
-            metadata = " ".join([
-                clean_text(
-                    department_obj.get(
-                        "label"
-                    )
-                ),
-                clean_text(
-                    function_obj.get(
-                        "label"
-                    )
-                ),
-            ])
-
-            if not is_relevant_job(
-                title,
-                metadata,
-            ):
-                continue
-
-            country = classify_location(
-                location,
-                remote_flag,
-                country_code,
-            )
-
-            if country not in (
-                "India",
-                "USA",
-            ):
-                continue
-
-            posted = ""
-
-            job_id = str(
-                job.get("id")
-                or job.get("uuid")
-                or ""
-            )
-
-            ref = clean_text(
-                job.get("ref")
-            )
-
-            link = (
-                f"https://careers.smartrecruiters.com/"
-                f"{slug}/{job_id}"
-                if job_id
-                else ref
-            )
-
-            if not link:
-                continue
-
-            results.append({
-                "ats": "smartrecruiters",
-                "company": slug,
-                "job_id": job_id,
-                "title": title,
-                "location": location,
-                "country": country,
-                "posted_date": posted,
-                "job_url": link,
-            })
-
-        offset += len(content)
-
-        if (
-            total_found is not None
-            and offset >= total_found
-        ):
-            break
-
-        if len(content) < (
-            SMARTRECRUITERS_PAGE_SIZE
-        ):
-            break
-
-        if offset > 100000:
-            break
-
-    return results
-
-
 FETCHERS = {
     "greenhouse": fetch_greenhouse,
     "ashby": fetch_ashby,
     "lever": fetch_lever,
     "workable": fetch_workable,
-    "smartrecruiters": fetch_smartrecruiters,
 }
 
 
 # ============================================================
-# DISCOVER + VALIDATE
+# DISCOVER + VALIDATE ALL BOARDS
 # ============================================================
 
 def discover_all_boards():
@@ -2025,26 +2016,74 @@ def crawl_boards(
 
 
 # ============================================================
-# DEDUPLICATION
+# CURRENT-RUN DEDUPLICATION
 # ============================================================
 
 def deduplicate_jobs(
     jobs,
 ):
+    """
+    Remove duplicates inside the current crawl.
+
+    Primary key:
+        ATS + Job ID
+
+    Secondary:
+        normalized URL
+
+    Fallback:
+        company + title + location
+    """
+
     unique = {}
+
+    url_keys = set()
+    fallback_keys = set()
 
     for job in jobs:
 
         job_key = make_job_key(
-            job["ats"],
-            job["job_id"],
-            job["job_url"],
+            job.get("ats", ""),
+            job.get("job_id", ""),
+            job.get("job_url", ""),
         )
 
-        if job_key not in unique:
-            unique[
-                job_key
-            ] = job
+        url_key = normalize_url(
+            job.get("job_url", "")
+        ).lower()
+
+        fallback_key = (
+            make_fallback_job_key(
+                job
+            )
+        )
+
+        if job_key in unique:
+            continue
+
+        if (
+            url_key
+            and url_key in url_keys
+        ):
+            continue
+
+        if (
+            fallback_key
+            and fallback_key in fallback_keys
+        ):
+            continue
+
+        unique[job_key] = job
+
+        if url_key:
+            url_keys.add(
+                url_key
+            )
+
+        if fallback_key:
+            fallback_keys.add(
+                fallback_key
+            )
 
     return list(
         unique.values()
@@ -2058,7 +2097,16 @@ def deduplicate_jobs(
 def load_existing_keys(
     worksheet,
 ):
+    """
+    Read the existing Jobs sheet and build duplicate keys.
+
+    This is what prevents a job already added to the sheet
+    from being added again on the next daily run.
+    """
+
     existing = set()
+    existing_urls = set()
+    existing_fallbacks = set()
 
     try:
         rows = (
@@ -2066,62 +2114,148 @@ def load_existing_keys(
         )
 
         if not rows:
-            return existing
+            return (
+                existing,
+                existing_urls,
+                existing_fallbacks,
+            )
 
         headers = rows[0]
 
-        try:
-            ats_index = headers.index(
-                "ATS"
-            )
-        except ValueError:
-            ats_index = -1
+        def find_header(
+            *names
+        ):
+            for name in names:
+                try:
+                    return headers.index(
+                        name
+                    )
+                except ValueError:
+                    continue
 
-        try:
-            id_index = headers.index(
-                "Job ID"
-            )
-        except ValueError:
-            id_index = -1
+            return -1
 
-        try:
-            url_index = headers.index(
-                "Job Link"
-            )
-        except ValueError:
-            url_index = -1
+        ats_index = find_header(
+            "ATS"
+        )
+
+        id_index = find_header(
+            "Job ID"
+        )
+
+        url_index = find_header(
+            "Job Link",
+            "Job URL",
+        )
+
+        company_index = find_header(
+            "Company"
+        )
+
+        title_index = find_header(
+            "Job Title",
+            "Title",
+        )
+
+        location_index = find_header(
+            "Location"
+        )
 
         for row in rows[1:]:
 
             ats = (
                 row[ats_index]
-                if ats_index >= 0
-                and len(row) > ats_index
+                if (
+                    ats_index >= 0
+                    and len(row)
+                    > ats_index
+                )
                 else ""
             )
 
             job_id = (
                 row[id_index]
-                if id_index >= 0
-                and len(row) > id_index
+                if (
+                    id_index >= 0
+                    and len(row)
+                    > id_index
+                )
                 else ""
             )
 
             url = (
                 row[url_index]
-                if url_index >= 0
-                and len(row) > url_index
+                if (
+                    url_index >= 0
+                    and len(row)
+                    > url_index
+                )
+                else ""
+            )
+
+            company = (
+                row[company_index]
+                if (
+                    company_index >= 0
+                    and len(row)
+                    > company_index
+                )
+                else ""
+            )
+
+            title = (
+                row[title_index]
+                if (
+                    title_index >= 0
+                    and len(row)
+                    > title_index
+                )
+                else ""
+            )
+
+            location = (
+                row[location_index]
+                if (
+                    location_index >= 0
+                    and len(row)
+                    > location_index
+                )
                 else ""
             )
 
             if ats and job_id:
                 existing.add(
-                    f"{ats}:{job_id}"
+                    f"{ats.lower()}:{job_id}"
                 )
 
-            if url:
-                existing.add(
-                    normalize_url(url)
+            normalized_url = (
+                normalize_url(
+                    url
+                ).lower()
+            )
+
+            if normalized_url:
+                existing_urls.add(
+                    normalized_url
+                )
+
+            if (
+                company
+                or title
+                or location
+            ):
+                raw = (
+                    f"{normalize_for_duplicate(company)}|"
+                    f"{normalize_for_duplicate(title)}|"
+                    f"{normalize_for_duplicate(location)}"
+                )
+
+                existing_fallbacks.add(
+                    hashlib.sha256(
+                        raw.encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()
                 )
 
     except Exception as exc:
@@ -2130,19 +2264,58 @@ def load_existing_keys(
             f"Jobs sheet: {exc}"
         )
 
-    return existing
+    return (
+        existing,
+        existing_urls,
+        existing_fallbacks,
+    )
 
 
 # ============================================================
-# WRITE TO GOOGLE SHEETS
+# SHEET HEADER
 # ============================================================
 
-def save_jobs(
-    jobs,
+NEW_HEADERS = [
+    "Added Date",
+    "Company",
+    "Job Title",
+    "Location",
+    "Country",
+    "Posted Date",
+    "Job Link",
+    "ATS",
+    "Job ID",
+]
+
+
+def ensure_sheet_headers(
+    worksheet,
 ):
-    worksheet = get_google_sheet()
+    """
+    Ensure the Jobs sheet uses the new 9-column structure.
 
-    headers = [
+    If the existing sheet still has the old 8-column header,
+    the new Added Date column is inserted at column A while
+    preserving the existing job data.
+    """
+
+    values = (
+        worksheet.get_all_values()
+    )
+
+    if not values:
+        worksheet.append_row(
+            NEW_HEADERS,
+            value_input_option="RAW",
+        )
+        return
+
+    current_headers = values[0]
+
+    if current_headers == NEW_HEADERS:
+        return
+
+    old_headers = [
         "Company",
         "Job Title",
         "Location",
@@ -2153,45 +2326,167 @@ def save_jobs(
         "Job ID",
     ]
 
-    existing_values = (
-        worksheet.get_all_values()
+    if current_headers == old_headers:
+
+        # Insert a physical first column.
+        try:
+            worksheet.insert_cols(
+                ["" for _ in range(
+                    len(values)
+                )],
+                1,
+            )
+
+        except Exception:
+            # If insert_cols behaves differently with a
+            # particular gspread version, rebuild the rows.
+            rebuilt = []
+
+            rebuilt.append(
+                NEW_HEADERS
+            )
+
+            for row in values[1:]:
+                padded = (
+                    row
+                    + [""] * (
+                        8 - len(row)
+                    )
+                )
+
+                rebuilt.append([
+                    "",
+                    padded[0],
+                    padded[1],
+                    padded[2],
+                    padded[3],
+                    padded[4],
+                    padded[5],
+                    padded[6],
+                    padded[7],
+                ])
+
+            worksheet.clear()
+
+            worksheet.update(
+                "A1",
+                rebuilt,
+                value_input_option="RAW",
+            )
+
+            return
+
+        # Write the new header.
+        worksheet.update(
+            "A1:I1",
+            [NEW_HEADERS],
+            value_input_option="RAW",
+        )
+
+        # Fill Added Date for old rows if empty.
+        # We use today's date because those rows were
+        # already imported before Added Date existed.
+        if len(values) > 1:
+            today = datetime.now(
+                timezone.utc
+            ).date().strftime(
+                DATE_FORMAT
+            )
+
+            added_dates = [
+                [today]
+                for _ in values[1:]
+            ]
+
+            worksheet.update(
+                f"A2:A{len(values)}",
+                added_dates,
+                value_input_option="RAW",
+            )
+
+        return
+
+    print(
+        "\nWARNING: Jobs sheet has an "
+        "unexpected header structure."
     )
 
-    if not existing_values:
+    print(
+        "The crawler will preserve existing "
+        "data and will not delete it."
+    )
 
-        worksheet.append_row(
-            headers
-        )
 
-    elif existing_values[0] != headers:
+# ============================================================
+# SAVE NEW JOBS
+# ============================================================
 
-        print(
-            "Existing Jobs sheet has a "
-            "different header structure. "
-            "Existing data will not be "
-            "deleted."
-        )
+def save_jobs(
+    jobs,
+):
+    worksheet = get_google_sheet()
 
-    existing_keys = (
-        load_existing_keys(
-            worksheet
-        )
+    # Ensure Added Date is the first column.
+    ensure_sheet_headers(
+        worksheet
+    )
+
+    (
+        existing_keys,
+        existing_urls,
+        existing_fallbacks,
+    ) = load_existing_keys(
+        worksheet
     )
 
     new_rows = []
 
+    added_date = datetime.now(
+        timezone.utc
+    ).date().strftime(
+        DATE_FORMAT
+    )
+
     for job in jobs:
 
+        ats = str(
+            job.get("ats", "")
+        ).strip()
+
+        job_id = str(
+            job.get("job_id", "")
+        ).strip()
+
+        job_url = str(
+            job.get("job_url", "")
+        ).strip()
+
         id_key = (
-            f"{job['ats']}:"
-            f"{job['job_id']}"
-            if job["job_id"]
+            f"{ats.lower()}:"
+            f"{job_id}"
+            if (
+                ats
+                and job_id
+            )
             else ""
         )
 
-        url_key = normalize_url(
-            job["job_url"]
+        url_key = (
+            normalize_url(
+                job_url
+            ).lower()
         )
+
+        fallback_key = (
+            make_fallback_job_key(
+                job
+            )
+        )
+
+        # ----------------------------------------------------
+        # DUPLICATE CHECK #1
+        # Existing ATS + Job ID
+        # ----------------------------------------------------
 
         if (
             id_key
@@ -2199,31 +2494,56 @@ def save_jobs(
         ):
             continue
 
+        # ----------------------------------------------------
+        # DUPLICATE CHECK #2
+        # Existing normalized URL
+        # ----------------------------------------------------
+
         if (
             url_key
-            and url_key in existing_keys
+            and url_key in existing_urls
+        ):
+            continue
+
+        # ----------------------------------------------------
+        # DUPLICATE CHECK #3
+        # Existing company + title + location
+        # ----------------------------------------------------
+
+        if (
+            fallback_key
+            and fallback_key
+            in existing_fallbacks
         ):
             continue
 
         new_rows.append([
-            job["company"],
-            job["title"],
-            job["location"],
-            job["country"],
-            job["posted_date"],
-            job["job_url"],
-            job["ats"],
-            job["job_id"],
+            added_date,
+            job.get("company", ""),
+            job.get("title", ""),
+            job.get("location", ""),
+            job.get("country", ""),
+            job.get("posted_date", ""),
+            job.get("job_url", ""),
+            job.get("ats", ""),
+            job.get("job_id", ""),
         ])
 
+        # Add immediately so another matching job
+        # in this same run cannot be inserted again.
         if id_key:
             existing_keys.add(
                 id_key
             )
 
         if url_key:
-            existing_keys.add(
+            existing_urls.add(
                 url_key
+            )
+
+        if fallback_key:
+            existing_fallbacks.add(
+                fallback_key
             )
 
     if not new_rows:
@@ -2284,6 +2604,10 @@ def main():
         )
 
     print(
+        "\nSmartRecruiters: REMOVED"
+    )
+
+    print(
         "\nNiche:"
     )
 
@@ -2311,8 +2635,17 @@ def main():
         "  USA"
     )
 
+    print(
+        "\nRemote only: YES"
+    )
+
+    print(
+        f"Job age window: "
+        f"{MAX_JOB_AGE_DAYS} days"
+    )
+
     # --------------------------------------------------------
-    # STEP 1: DISCOVER BOARDS
+    # STEP 1
     # --------------------------------------------------------
 
     print(
@@ -2351,7 +2684,7 @@ def main():
         return
 
     # --------------------------------------------------------
-    # STEP 2: CRAWL JOBS
+    # STEP 2
     # --------------------------------------------------------
 
     print(
@@ -2370,12 +2703,12 @@ def main():
     )
 
     # --------------------------------------------------------
-    # STEP 3: DEDUPLICATE
+    # STEP 3
     # --------------------------------------------------------
 
     print(
         "\nSTEP 3 — "
-        "Deduplicating"
+        "Removing duplicates"
     )
 
     jobs = deduplicate_jobs(
@@ -2383,12 +2716,12 @@ def main():
     )
 
     print(
-        f"Unique jobs: "
+        f"Unique jobs in this run: "
         f"{len(jobs)}"
     )
 
     # --------------------------------------------------------
-    # STEP 4: GOOGLE SHEETS
+    # STEP 4
     # --------------------------------------------------------
 
     print(
