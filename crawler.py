@@ -5,7 +5,7 @@ import time
 import hashlib
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 
 import requests
 import gspread
@@ -17,7 +17,7 @@ from google.oauth2.service_account import Credentials
 # ============================================================
 #
 # Purpose:
-#   Discover public ATS boards and collect relevant jobs.
+#   Discover public ATS boards and collect relevant remote jobs.
 #
 # Current niche:
 #   Customer Support
@@ -32,6 +32,8 @@ from google.oauth2.service_account import Credentials
 #   Greenhouse
 #   Ashby
 #   Lever
+#   Workable
+#   SmartRecruiters
 #
 # Runs automatically through GitHub Actions.
 # ============================================================
@@ -42,24 +44,28 @@ from google.oauth2.service_account import Credentials
 # ============================================================
 
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
-
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
 
-# Maximum number of concurrent requests.
-# Keep this moderate to avoid hammering public endpoints.
+# Maximum concurrent HTTP requests.
+# 8 is intentionally moderate for public ATS endpoints.
 CONCURRENCY = 8
 
-# How many days of newly discovered jobs to keep.
-# We use 30 days because some ATS systems expose older postings.
+# Keep jobs whose ATS publication date is within this window.
+# If an ATS does not expose a date in its list endpoint, the job
+# is allowed because it is currently returned as an active posting.
 MAX_JOB_AGE_DAYS = 30
 
-# How many ATS boards to scan in one GitHub run.
-# 0 = all discovered boards.
+# 0 = all discovered live boards.
 MAX_BOARDS_PER_RUN = 0
 
-# Refresh board discovery every run.
-# This helps discover newly appearing companies.
+# Board discovery is refreshed every run.
 REFRESH_BOARDS = True
+
+# SmartRecruiters max page size is 100.
+SMARTRECRUITERS_PAGE_SIZE = 100
+
+# User agent for public ATS endpoints.
+USER_AGENT = "Remote4.me Job Crawler/2.0"
 
 
 # ============================================================
@@ -88,54 +94,214 @@ ATS_SOURCES = {
         ],
         "api": "https://api.lever.co/v0/postings/{slug}?mode=json",
     },
+
+    "workable": {
+        "archive_domains": [
+            "apply.workable.com",
+        ],
+        "api": "https://www.workable.com/api/accounts/{slug}",
+    },
+
+    "smartrecruiters": {
+        "archive_domains": [
+            "careers.smartrecruiters.com",
+        ],
+        "api": "https://api.smartrecruiters.com/v1/companies/{slug}/postings",
+    },
 }
 
 
 # ============================================================
-# YOUR REMOTE4.ME NICHE
+# REMOTE4.ME TARGET KEYWORDS
 # ============================================================
 
 TARGET_TITLE_PATTERNS = [
+
+    # ----------------------------
     # Customer Support
+    # ----------------------------
+    r"\bcustomer support\b",
+    r"\bcustomer support specialist\b",
+    r"\bcustomer support associate\b",
+    r"\bcustomer support representative\b",
+    r"\bcustomer support agent\b",
+    r"\bcustomer service\b",
+    r"\bcustomer service specialist\b",
+    r"\bcustomer service representative\b",
+    r"\bcustomer service associate\b",
+    r"\bcustomer service agent\b",
+    r"\bcustomer care\b",
+    r"\bcustomer care specialist\b",
+    r"\bcustomer care representative\b",
+    r"\bcustomer experience\b",
+    r"\bcustomer experience specialist\b",
+    r"\bcustomer experience associate\b",
+    r"\bcustomer experience representative\b",
+    r"\bclient support\b",
+    r"\bclient support specialist\b",
+    r"\bclient support representative\b",
+    r"\bclient services\b",
+    r"\bclient service\b",
+    r"\bmember support\b",
+    r"\bmember services\b",
+    r"\buser support\b",
+    r"\buser services\b",
+    r"\buser support specialist\b",
+    r"\buser support representative\b",
+    r"\bsupport specialist\b",
+    r"\bsupport associate\b",
+    r"\bsupport representative\b",
+    r"\bsupport agent\b",
+    r"\bsupport coordinator\b",
+    r"\bsupport advisor\b",
+    r"\bsupport consultant\b",
+    r"\bsupport executive\b",
+    r"\bsupport analyst\b",
+    r"\bsupport operations\b",
+    r"\bcustomer operations\b",
+    r"\bcustomer operations specialist\b",
+    r"\bcustomer operations associate\b",
+    r"\bclient operations\b",
+    r"\bclient operations specialist\b",
+
+    # ----------------------------
+    # Technical Support
+    # ----------------------------
+    r"\btechnical support\b",
+    r"\btechnical support specialist\b",
+    r"\btechnical support associate\b",
+    r"\btechnical support representative\b",
+    r"\btechnical support engineer\b",
+    r"\btechnical support analyst\b",
+    r"\btechnical support consultant\b",
+    r"\btechnical support agent\b",
+    r"\btechnical customer support\b",
+    r"\btechnical customer service\b",
+    r"\btechnical assistance\b",
+    r"\btechnical solutions support\b",
+    r"\bproduct support\b",
+    r"\bproduct support specialist\b",
+    r"\bproduct support engineer\b",
+    r"\bproduct support associate\b",
+    r"\bproduct support representative\b",
+    r"\bsoftware support\b",
+    r"\bsoftware support specialist\b",
+    r"\bsoftware support engineer\b",
+    r"\bapplication support\b",
+    r"\bapplication support specialist\b",
+    r"\bapplication support analyst\b",
+    r"\bapplication support engineer\b",
+    r"\bplatform support\b",
+    r"\bplatform support specialist\b",
+    r"\bplatform support engineer\b",
+    r"\bit support\b",
+    r"\bit support specialist\b",
+    r"\bit support engineer\b",
+    r"\bit support analyst\b",
+    r"\bhelp desk\b",
+    r"\bhelpdesk\b",
+    r"\bhelp desk specialist\b",
+    r"\bhelp desk analyst\b",
+    r"\bservice desk\b",
+    r"\bservice desk analyst\b",
+    r"\bservice desk specialist\b",
+    r"\btechnical account support\b",
+    r"\btechnical account specialist\b",
+    r"\btechnical account manager\b",
+    r"\btechnical success\b",
+    r"\btechnical customer success\b",
+
+    # ----------------------------
+    # Customer Success
+    # ----------------------------
+    r"\bcustomer success\b",
+    r"\bcustomer success specialist\b",
+    r"\bcustomer success associate\b",
+    r"\bcustomer success manager\b",
+    r"\bcustomer success executive\b",
+    r"\bcustomer success representative\b",
+    r"\bcustomer success consultant\b",
+    r"\bcustomer success advisor\b",
+    r"\bcustomer success analyst\b",
+    r"\bcustomer success operations\b",
+    r"\bclient success\b",
+    r"\bclient success specialist\b",
+    r"\bclient success associate\b",
+    r"\bclient success manager\b",
+    r"\bclient success consultant\b",
+    r"\bcustomer onboarding\b",
+    r"\bcustomer onboarding specialist\b",
+    r"\bcustomer onboarding manager\b",
+    r"\bcustomer onboarding associate\b",
+    r"\bclient onboarding\b",
+    r"\bclient onboarding specialist\b",
+    r"\bclient onboarding manager\b",
+    r"\bonboarding specialist\b",
+    r"\bonboarding manager\b",
+    r"\bonboarding associate\b",
+    r"\bonboarding consultant\b",
+    r"\bimplementation specialist\b",
+    r"\bimplementation manager\b",
+    r"\bimplementation consultant\b",
+    r"\bimplementation associate\b",
+    r"\bcustomer implementation\b",
+    r"\bclient implementation\b",
+    r"\bcustomer enablement\b",
+    r"\bcustomer education\b",
+    r"\bcustomer advocacy\b",
+    r"\bcustomer experience manager\b",
+    r"\bcustomer experience specialist\b",
+    r"\bclient experience\b",
+    r"\bclient experience specialist\b",
+]
+
+TITLE_REGEX = re.compile(
+    "|".join(TARGET_TITLE_PATTERNS),
+    re.IGNORECASE,
+)
+
+
+# ============================================================
+# METADATA KEYWORDS
+# ============================================================
+
+SUPPORT_METADATA_PATTERNS = [
     r"\bcustomer support\b",
     r"\bcustomer service\b",
     r"\bcustomer care\b",
     r"\bcustomer experience\b",
-    r"\bsupport specialist\b",
-    r"\bsupport representative\b",
-    r"\bsupport associate\b",
     r"\bclient support\b",
+    r"\bclient service\b",
     r"\bmember support\b",
-
-    # Technical Support
+    r"\buser support\b",
+    r"\bsupport\b",
     r"\btechnical support\b",
-    r"\btechnical support specialist\b",
-    r"\btechnical support engineer\b",
-    r"\bsupport engineer\b",
     r"\bproduct support\b",
-    r"\bsoftware support\b",
     r"\bapplication support\b",
-    r"\bit support\b",
+    r"\bsoftware support\b",
+    r"\bplatform support\b",
     r"\bhelp desk\b",
     r"\bhelpdesk\b",
     r"\bservice desk\b",
+]
 
-    # Customer Success
+SUCCESS_METADATA_PATTERNS = [
     r"\bcustomer success\b",
-    r"\bcustomer success specialist\b",
-    r"\bcustomer success manager\b",
     r"\bclient success\b",
     r"\bcustomer onboarding\b",
     r"\bclient onboarding\b",
-    r"\bonboarding specialist\b",
-    r"\bimplementation specialist\b",
-    r"\bcustomer implementation\b",
-    r"\bclient implementation\b",
+    r"\bonboarding\b",
+    r"\bimplementation\b",
+    r"\bcustomer enablement\b",
+    r"\bcustomer education\b",
+    r"\bcustomer advocacy\b",
 ]
 
-
-TITLE_REGEX = re.compile(
-    "|".join(TARGET_TITLE_PATTERNS),
+METADATA_REGEX = re.compile(
+    "|".join(
+        SUPPORT_METADATA_PATTERNS
+        + SUCCESS_METADATA_PATTERNS
+    ),
     re.IGNORECASE,
 )
 
@@ -162,6 +328,7 @@ INDIA_PATTERNS = [
     r"\bkochi\b",
     r"\bkerala\b",
     r"\bjaipur\b",
+    r"\bchandigarh\b",
     r"\bindian\b",
 ]
 
@@ -170,15 +337,56 @@ USA_PATTERNS = [
     r"\busa\b",
     r"\bu\.s\.\b",
     r"\bunited states of america\b",
+    r"\balabama\b",
+    r"\balaska\b",
+    r"\barizona\b",
+    r"\barkansas\b",
     r"\bcalifornia\b",
-    r"\btexas\b",
-    r"\bnew york\b",
-    r"\bflorida\b",
-    r"\bwashington\b",
-    r"\billinois\b",
-    r"\bmassachusetts\b",
     r"\bcolorado\b",
+    r"\bconnecticut\b",
+    r"\bdelaware\b",
+    r"\bflorida\b",
     r"\bgeorgia\b",
+    r"\bhawaii\b",
+    r"\bidaho\b",
+    r"\billinois\b",
+    r"\bindiana\b",
+    r"\biowa\b",
+    r"\bkansas\b",
+    r"\bkentucky\b",
+    r"\blouisiana\b",
+    r"\bmaine\b",
+    r"\bmaryland\b",
+    r"\bmassachusetts\b",
+    r"\bmichigan\b",
+    r"\bminnesota\b",
+    r"\bmississippi\b",
+    r"\bmissouri\b",
+    r"\bmontana\b",
+    r"\bnebraska\b",
+    r"\bnevada\b",
+    r"\bnew hampshire\b",
+    r"\bnew jersey\b",
+    r"\bnew mexico\b",
+    r"\bnew york\b",
+    r"\bnorth carolina\b",
+    r"\bnorth dakota\b",
+    r"\bohio\b",
+    r"\boklahoma\b",
+    r"\boregon\b",
+    r"\bpennsylvania\b",
+    r"\brhode island\b",
+    r"\bsouth carolina\b",
+    r"\bsouth dakota\b",
+    r"\btennessee\b",
+    r"\btexas\b",
+    r"\butah\b",
+    r"\bvermont\b",
+    r"\bvirginia\b",
+    r"\bwashington\b",
+    r"\bwest virginia\b",
+    r"\bwisconsin\b",
+    r"\bwyoming\b",
     r"\baustin\b",
     r"\bseattle\b",
     r"\bboston\b",
@@ -186,15 +394,25 @@ USA_PATTERNS = [
     r"\bsan francisco\b",
     r"\blos angeles\b",
     r"\bnew york city\b",
+    r"\bsan diego\b",
+    r"\bdenver\b",
+    r"\batlanta\b",
+    r"\bdallas\b",
+    r"\bhouston\b",
+    r"\bmiami\b",
+    r"\bphoenix\b",
+    r"\bphiladelphia\b",
+    r"\bportland\b",
+    r"\bwashington dc\b",
+    r"\bwashington d\.c\.\b",
 ]
 
 REMOTE_PATTERNS = [
     r"\bremote\b",
     r"\bwork from home\b",
     r"\bdistributed\b",
-    r"\banywhere\b",
+    r"\bhome[- ]based\b",
 ]
-
 
 INDIA_REGEX = re.compile(
     "|".join(INDIA_PATTERNS),
@@ -219,7 +437,7 @@ REMOTE_REGEX = re.compile(
 SESSION = requests.Session()
 
 SESSION.headers.update({
-    "User-Agent": "Remote4.me Job Crawler/1.0",
+    "User-Agent": USER_AGENT,
     "Accept": "application/json,text/plain,*/*",
 })
 
@@ -230,29 +448,41 @@ SESSION.headers.update({
 
 def get_google_sheet():
     if not SPREADSHEET_ID:
-        raise RuntimeError("Missing SPREADSHEET_ID GitHub secret.")
+        raise RuntimeError(
+            "Missing SPREADSHEET_ID GitHub secret."
+        )
 
     if not GOOGLE_CREDENTIALS:
-        raise RuntimeError("Missing GOOGLE_CREDENTIALS GitHub secret.")
+        raise RuntimeError(
+            "Missing GOOGLE_CREDENTIALS GitHub secret."
+        )
 
-    credentials_info = json.loads(GOOGLE_CREDENTIALS)
+    credentials_info = json.loads(
+        GOOGLE_CREDENTIALS
+    )
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
 
-    credentials = Credentials.from_service_account_info(
-        credentials_info,
-        scopes=scopes,
+    credentials = (
+        Credentials.from_service_account_info(
+            credentials_info,
+            scopes=scopes,
+        )
     )
 
     client = gspread.authorize(credentials)
 
-    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    spreadsheet = client.open_by_key(
+        SPREADSHEET_ID
+    )
 
     try:
-        worksheet = spreadsheet.worksheet("Jobs")
+        worksheet = spreadsheet.worksheet(
+            "Jobs"
+        )
     except gspread.WorksheetNotFound:
         worksheet = spreadsheet.add_worksheet(
             title="Jobs",
@@ -273,7 +503,17 @@ def clean_text(value):
 
     value = str(value)
 
-    value = re.sub(r"\s+", " ", value)
+    value = re.sub(
+        r"<[^>]+>",
+        " ",
+        value,
+    )
+
+    value = re.sub(
+        r"\s+",
+        " ",
+        value,
+    )
 
     return value.strip()
 
@@ -282,21 +522,35 @@ def normalize_url(url):
     if not url:
         return ""
 
-    url = url.strip()
+    url = str(url).strip()
 
-    # Remove tracking query strings where possible.
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
 
-    clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        clean = (
+            f"{parsed.scheme}://"
+            f"{parsed.netloc}"
+            f"{parsed.path}"
+        )
 
-    return clean.rstrip("/")
+        return clean.rstrip("/")
+
+    except Exception:
+        return url.rstrip("/")
 
 
-def make_job_key(ats, job_id, url):
+def make_job_key(
+    ats,
+    job_id,
+    url,
+):
     if job_id:
         raw = f"{ats}:{job_id}"
     else:
-        raw = f"{ats}:{normalize_url(url)}"
+        raw = (
+            f"{ats}:"
+            f"{normalize_url(url)}"
+        )
 
     return hashlib.sha256(
         raw.encode("utf-8")
@@ -307,12 +561,14 @@ def parse_date(value):
     if not value:
         return ""
 
-    value = str(value)
+    value = str(value).strip()
 
-    # ISO timestamp
     try:
         dt = datetime.fromisoformat(
-            value.replace("Z", "+00:00")
+            value.replace(
+                "Z",
+                "+00:00",
+            )
         )
 
         return dt.date().isoformat()
@@ -320,7 +576,15 @@ def parse_date(value):
     except Exception:
         pass
 
-    # Lever epoch milliseconds
+    try:
+        return datetime.strptime(
+            value[:10],
+            "%Y-%m-%d",
+        ).date().isoformat()
+
+    except Exception:
+        pass
+
     try:
         number = int(value)
 
@@ -338,12 +602,139 @@ def parse_date(value):
     return ""
 
 
+def request_json(
+    url,
+    timeout=30,
+    params=None,
+):
+    """
+    GET JSON with a small retry policy for temporary
+    429/5xx responses.
+    """
+
+    for attempt in range(3):
+
+        try:
+            response = SESSION.get(
+                url,
+                params=params,
+                timeout=timeout,
+            )
+
+            if response.status_code == 200:
+                return response.json()
+
+            if response.status_code in (
+                429,
+                500,
+                502,
+                503,
+                504,
+            ):
+                if attempt < 2:
+                    time.sleep(
+                        1.5 * (attempt + 1)
+                    )
+                    continue
+
+            return None
+
+        except Exception:
+
+            if attempt < 2:
+                time.sleep(
+                    1.5 * (attempt + 1)
+                )
+                continue
+
+            return None
+
+    return None
+
+
+# ============================================================
+# JOB MATCHING
+# ============================================================
+
+def is_target_title(title):
+    if not title:
+        return False
+
+    return bool(
+        TITLE_REGEX.search(
+            clean_text(title)
+        )
+    )
+
+
+def has_relevant_metadata(metadata):
+    if not metadata:
+        return False
+
+    return bool(
+        METADATA_REGEX.search(
+            clean_text(metadata)
+        )
+    )
+
+
+def is_relevant_job(
+    title,
+    metadata="",
+):
+    """
+    Primary signal is the title.
+
+    Metadata is accepted only when the title is a short,
+    role-like word such as Specialist/Associate/Representative
+    and the ATS itself classifies it as Support/Success/etc.
+    """
+
+    title = clean_text(title)
+    metadata = clean_text(metadata)
+
+    if is_target_title(title):
+        return True
+
+    generic_role = re.search(
+        r"\b("
+        r"specialist|associate|representative|"
+        r"advisor|agent|analyst|coordinator|"
+        r"consultant|executive|engineer|"
+        r"manager"
+        r")\b",
+        title,
+        re.IGNORECASE,
+    )
+
+    if generic_role and has_relevant_metadata(
+        metadata
+    ):
+        return True
+
+    return False
+
+
 # ============================================================
 # LOCATION CLASSIFICATION
 # ============================================================
 
-def classify_location(location, remote=False):
+def classify_location(
+    location,
+    remote=False,
+    country_code="",
+):
     location = clean_text(location)
+
+    code = clean_text(
+        country_code
+    ).upper()
+
+    if code == "IN":
+        return "India"
+
+    if code == "US":
+        return "USA"
 
     if INDIA_REGEX.search(location):
         return "India"
@@ -351,29 +742,12 @@ def classify_location(location, remote=False):
     if USA_REGEX.search(location):
         return "USA"
 
-    # For genuinely remote jobs, we need to inspect the wording.
-    #
-    # We do NOT automatically accept every worldwide remote job,
-    # because your current site focus is India + USA.
-    #
-    # "Worldwide", "Global", etc. are kept as ambiguous and
-    # rejected unless the posting explicitly mentions India or USA.
-
+    # Worldwide/global remote jobs are intentionally rejected
+    # unless India or USA is explicitly stated.
     if remote or REMOTE_REGEX.search(location):
         return ""
 
     return ""
-
-
-# ============================================================
-# TITLE FILTER
-# ============================================================
-
-def is_target_title(title):
-    if not title:
-        return False
-
-    return bool(TITLE_REGEX.search(title))
 
 
 # ============================================================
@@ -382,8 +756,6 @@ def is_target_title(title):
 
 def is_recent(posted_date):
     if not posted_date:
-        # Unknown dates are allowed rather than falsely
-        # assigning today's date.
         return True
 
     try:
@@ -394,7 +766,9 @@ def is_recent(posted_date):
 
         cutoff = (
             datetime.now(timezone.utc).date()
-            - timedelta(days=MAX_JOB_AGE_DAYS)
+            - timedelta(
+                days=MAX_JOB_AGE_DAYS
+            )
         )
 
         return dt >= cutoff
@@ -407,11 +781,20 @@ def is_recent(posted_date):
 # ATS BOARD DISCOVERY
 # ============================================================
 
-def extract_slug_from_url(url, domain):
+def extract_slug_from_url(
+    url,
+    domain,
+):
     try:
         parsed = urlparse(url)
 
-        if parsed.netloc.lower() != domain.lower():
+        hostname = (
+            parsed.netloc
+            .lower()
+            .split(":")[0]
+        )
+
+        if hostname != domain.lower():
             return None
 
         path = parsed.path.strip("/")
@@ -426,7 +809,6 @@ def extract_slug_from_url(url, domain):
         if not slug:
             return None
 
-        # Ignore obvious non-board paths.
         blocked = {
             "jobs",
             "job",
@@ -440,12 +822,14 @@ def extract_slug_from_url(url, domain):
             "search",
             "assets",
             "static",
+            "api",
+            "locations",
+            "departments",
         }
 
         if slug.lower() in blocked:
             return None
 
-        # Reasonable board slug validation.
         if len(slug) < 2 or len(slug) > 150:
             return None
 
@@ -455,18 +839,18 @@ def extract_slug_from_url(url, domain):
         return None
 
 
-def discover_from_wayback(domain):
+def discover_from_wayback(
+    domain,
+):
     """
-    Discover candidate board URLs from Internet Archive CDX.
-
-    We request URL keys only, which keeps the response smaller.
+    Discover candidate board slugs from Internet Archive CDX.
     """
 
     candidates = set()
 
     url = (
         "https://web.archive.org/cdx/search/cdx"
-        f"?url={domain}/*"
+        f"?url={quote(domain + '/*', safe=':/?*')}"
         "&output=json"
         "&fl=original"
         "&filter=statuscode:200"
@@ -482,20 +866,25 @@ def discover_from_wayback(domain):
 
         if response.status_code != 200:
             print(
-                f"Wayback returned {response.status_code} "
+                f"Wayback returned "
+                f"{response.status_code} "
                 f"for {domain}"
             )
-
             return candidates
 
         data = response.json()
 
         for item in data:
-            if isinstance(item, list):
+
+            if isinstance(
+                item,
+                list,
+            ):
                 if not item:
                     continue
 
                 original = item[0]
+
             else:
                 original = str(item)
 
@@ -509,13 +898,16 @@ def discover_from_wayback(domain):
 
     except Exception as exc:
         print(
-            f"Wayback discovery failed for {domain}: {exc}"
+            f"Wayback discovery failed "
+            f"for {domain}: {exc}"
         )
 
     return candidates
 
 
-def discover_boards_for_ats(ats):
+def discover_boards_for_ats(
+    ats,
+):
     source = ATS_SOURCES[ats]
 
     all_candidates = set()
@@ -524,10 +916,14 @@ def discover_boards_for_ats(ats):
         f"\nDiscovering {ats} boards..."
     )
 
-    for domain in source["archive_domains"]:
+    for domain in source[
+        "archive_domains"
+    ]:
 
-        candidates = discover_from_wayback(
-            domain
+        candidates = (
+            discover_from_wayback(
+                domain
+            )
         )
 
         print(
@@ -551,7 +947,10 @@ def discover_boards_for_ats(ats):
 # BOARD VALIDATION
 # ============================================================
 
-def validate_board(ats, slug):
+def validate_generic_board(
+    ats,
+    slug,
+):
     source = ATS_SOURCES[ats]
 
     url = source["api"].format(
@@ -568,7 +967,6 @@ def validate_board(ats, slug):
         if response.status_code == 200:
             return True
 
-        # Some servers don't support HEAD properly.
         if response.status_code in (
             403,
             405,
@@ -580,7 +978,10 @@ def validate_board(ats, slug):
                 stream=True,
             )
 
-            return response.status_code == 200
+            return (
+                response.status_code
+                == 200
+            )
 
     except Exception:
         pass
@@ -588,11 +989,102 @@ def validate_board(ats, slug):
     return False
 
 
+def validate_workable_board(
+    slug,
+):
+    url = (
+        ATS_SOURCES["workable"]["api"]
+        .format(slug=slug)
+    )
+
+    data = request_json(
+        url,
+        timeout=20,
+        params={
+            "details": "false"
+        },
+    )
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+        return False
+
+    return isinstance(
+        data.get("jobs"),
+        list,
+    )
+
+
+def validate_smartrecruiters_board(
+    slug,
+):
+    url = (
+        ATS_SOURCES[
+            "smartrecruiters"
+        ]["api"]
+        .format(slug=slug)
+    )
+
+    data = request_json(
+        url,
+        timeout=20,
+        params={
+            "limit": 1,
+            "offset": 0,
+            "destination": "PUBLIC",
+        },
+    )
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+        return False
+
+    try:
+        return int(
+            data.get(
+                "totalFound",
+                0,
+            )
+        ) > 0
+
+    except Exception:
+        return False
+
+
+def validate_board(
+    ats,
+    slug,
+):
+    if ats == "workable":
+        return validate_workable_board(
+            slug
+        )
+
+    if ats == "smartrecruiters":
+        return validate_smartrecruiters_board(
+            slug
+        )
+
+    return validate_generic_board(
+        ats,
+        slug,
+    )
+
+
 def validate_boards(
     ats,
     candidates,
 ):
     valid = []
+
+    candidates = sorted(
+        set(candidates),
+        key=str.lower,
+    )
 
     print(
         f"Validating {len(candidates)} "
@@ -618,11 +1110,15 @@ def validate_boards(
             futures
         ):
 
-            slug = futures[future]
+            slug = futures[
+                future
+            ]
 
             try:
                 if future.result():
-                    valid.append(slug)
+                    valid.append(
+                        slug
+                    )
 
             except Exception:
                 pass
@@ -651,298 +1147,703 @@ def validate_boards(
 # JOB FETCHERS
 # ============================================================
 
-def fetch_greenhouse(slug):
+def fetch_greenhouse(
+    slug,
+):
     url = (
-        ATS_SOURCES["greenhouse"]["api"]
+        ATS_SOURCES[
+            "greenhouse"
+        ]["api"]
         .format(slug=slug)
     )
 
-    try:
-        response = SESSION.get(
-            url,
-            timeout=30,
+    data = request_json(
+        url,
+        timeout=30,
+    )
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+        return []
+
+    jobs = data.get(
+        "jobs",
+        [],
+    )
+
+    results = []
+
+    for job in jobs:
+
+        title = clean_text(
+            job.get("title")
         )
 
-        if response.status_code != 200:
-            return []
+        if not is_relevant_job(
+            title
+        ):
+            continue
 
-        data = response.json()
+        location_obj = (
+            job.get("location")
+            or {}
+        )
 
-        jobs = data.get(
-            "jobs",
+        location = clean_text(
+            location_obj.get("name")
+        )
+
+        remote = bool(
+            REMOTE_REGEX.search(
+                location
+            )
+        )
+
+        country = classify_location(
+            location,
+            remote,
+        )
+
+        if country not in (
+            "India",
+            "USA",
+        ):
+            continue
+
+        posted = parse_date(
+            job.get(
+                "first_published"
+            )
+            or job.get(
+                "updated_at"
+            )
+        )
+
+        if not is_recent(
+            posted
+        ):
+            continue
+
+        job_id = str(
+            job.get("id")
+            or ""
+        )
+
+        link = (
+            job.get("absolute_url")
+            or ""
+        )
+
+        if not link:
+            continue
+
+        results.append({
+            "ats": "greenhouse",
+            "company": slug,
+            "job_id": job_id,
+            "title": title,
+            "location": location,
+            "country": country,
+            "posted_date": posted,
+            "job_url": link,
+        })
+
+    return results
+
+
+def fetch_ashby(
+    slug,
+):
+    url = (
+        ATS_SOURCES[
+            "ashby"
+        ]["api"]
+        .format(slug=slug)
+    )
+
+    data = request_json(
+        url,
+        timeout=30,
+    )
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+        return []
+
+    jobs = data.get(
+        "jobs",
+        [],
+    )
+
+    results = []
+
+    for job in jobs:
+
+        if job.get(
+            "isListed",
+            True,
+        ) is False:
+            continue
+
+        title = clean_text(
+            job.get("title")
+        )
+
+        metadata = " ".join([
+            clean_text(
+                job.get("department")
+            ),
+            clean_text(
+                job.get("team")
+            ),
+        ])
+
+        if not is_relevant_job(
+            title,
+            metadata,
+        ):
+            continue
+
+        locations = []
+
+        primary = job.get(
+            "location"
+        )
+
+        if primary:
+            locations.append(
+                clean_text(
+                    primary
+                )
+            )
+
+        for secondary in (
+            job.get(
+                "secondaryLocations"
+            )
+            or []
+        ):
+
+            if isinstance(
+                secondary,
+                dict,
+            ):
+                loc = secondary.get(
+                    "location"
+                )
+
+                if loc:
+                    locations.append(
+                        clean_text(loc)
+                    )
+
+        location = ", ".join(
+            dict.fromkeys(
+                locations
+            )
+        )
+
+        remote = bool(
+            job.get(
+                "isRemote",
+                False,
+            )
+        )
+
+        country = classify_location(
+            location,
+            remote,
+        )
+
+        if country not in (
+            "India",
+            "USA",
+        ):
+            continue
+
+        posted = parse_date(
+            job.get(
+                "publishedAt"
+            )
+        )
+
+        if not is_recent(
+            posted
+        ):
+            continue
+
+        job_id = str(
+            job.get("id")
+            or job.get("jobId")
+            or ""
+        )
+
+        link = (
+            job.get("jobUrl")
+            or job.get("applyUrl")
+            or ""
+        )
+
+        if not link:
+            continue
+
+        results.append({
+            "ats": "ashby",
+            "company": slug,
+            "job_id": job_id,
+            "title": title,
+            "location": location,
+            "country": country,
+            "posted_date": posted,
+            "job_url": link,
+        })
+
+    return results
+
+
+def fetch_lever(
+    slug,
+):
+    url = (
+        ATS_SOURCES[
+            "lever"
+        ]["api"]
+        .format(slug=slug)
+    )
+
+    data = request_json(
+        url,
+        timeout=30,
+    )
+
+    if not isinstance(
+        data,
+        list,
+    ):
+        return []
+
+    results = []
+
+    for job in data:
+
+        title = clean_text(
+            job.get("text")
+        )
+
+        categories = (
+            job.get("categories")
+            or {}
+        )
+
+        metadata = " ".join([
+            clean_text(
+                categories.get(
+                    "team"
+                )
+            ),
+            clean_text(
+                categories.get(
+                    "department"
+                )
+            ),
+        ])
+
+        if not is_relevant_job(
+            title,
+            metadata,
+        ):
+            continue
+
+        location = clean_text(
+            categories.get(
+                "location"
+            )
+        )
+
+        country_code = clean_text(
+            job.get("country")
+        )
+
+        workplace = clean_text(
+            job.get(
+                "workplaceType"
+            )
+        )
+
+        remote = (
+            workplace.lower()
+            == "remote"
+            or bool(
+                REMOTE_REGEX.search(
+                    location
+                )
+            )
+        )
+
+        country = classify_location(
+            location,
+            remote,
+            country_code,
+        )
+
+        if country not in (
+            "India",
+            "USA",
+        ):
+            continue
+
+        posted = parse_date(
+            job.get(
+                "createdAt"
+            )
+        )
+
+        if not is_recent(
+            posted
+        ):
+            continue
+
+        job_id = str(
+            job.get("id")
+            or ""
+        )
+
+        urls = (
+            job.get("urls")
+            or {}
+        )
+
+        link = (
+            urls.get("show")
+            or job.get("hostedUrl")
+            or job.get("applyUrl")
+            or ""
+        )
+
+        if not link:
+            continue
+
+        results.append({
+            "ats": "lever",
+            "company": slug,
+            "job_id": job_id,
+            "title": title,
+            "location": location,
+            "country": country,
+            "posted_date": posted,
+            "job_url": link,
+        })
+
+    return results
+
+
+def fetch_workable(
+    slug,
+):
+    url = (
+        ATS_SOURCES[
+            "workable"
+        ]["api"]
+        .format(slug=slug)
+    )
+
+    data = request_json(
+        url,
+        timeout=30,
+        params={
+            "details": "false"
+        },
+    )
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+        return []
+
+    jobs = data.get(
+        "jobs",
+        [],
+    )
+
+    results = []
+
+    for job in jobs:
+
+        title = clean_text(
+            job.get("title")
+        )
+
+        metadata = " ".join([
+            clean_text(
+                job.get("department")
+            ),
+            clean_text(
+                job.get("function")
+            ),
+        ])
+
+        if not is_relevant_job(
+            title,
+            metadata,
+        ):
+            continue
+
+        country_code = clean_text(
+            job.get("country")
+        )
+
+        state = clean_text(
+            job.get("state")
+        )
+
+        city = clean_text(
+            job.get("city")
+        )
+
+        location_parts = [
+            city,
+            state,
+            country_code,
+        ]
+
+        location = ", ".join(
+            dict.fromkeys(
+                x for x in location_parts
+                if x
+            )
+        )
+
+        workplace_type = clean_text(
+            job.get(
+                "workplace_type"
+            )
+        )
+
+        remote = (
+            bool(
+                job.get(
+                    "telecommuting",
+                    False,
+                )
+            )
+            or workplace_type.lower()
+            == "remote"
+            or bool(
+                REMOTE_REGEX.search(
+                    location
+                )
+            )
+        )
+
+        country = classify_location(
+            location,
+            remote,
+            country_code,
+        )
+
+        if country not in (
+            "India",
+            "USA",
+        ):
+            continue
+
+        posted = parse_date(
+            job.get(
+                "published_on"
+            )
+            or job.get(
+                "created_at"
+            )
+        )
+
+        if not is_recent(
+            posted
+        ):
+            continue
+
+        job_id = str(
+            job.get("shortcode")
+            or job.get("code")
+            or ""
+        )
+
+        link = (
+            job.get("application_url")
+            or job.get("url")
+            or job.get("shortlink")
+            or ""
+        )
+
+        if not link:
+            continue
+
+        results.append({
+            "ats": "workable",
+            "company": slug,
+            "job_id": job_id,
+            "title": title,
+            "location": location,
+            "country": country,
+            "posted_date": posted,
+            "job_url": link,
+        })
+
+    return results
+
+
+def fetch_smartrecruiters(
+    slug,
+):
+    url = (
+        ATS_SOURCES[
+            "smartrecruiters"
+        ]["api"]
+        .format(slug=slug)
+    )
+
+    results = []
+
+    offset = 0
+    total_found = None
+
+    while True:
+
+        data = request_json(
+            url,
+            timeout=30,
+            params={
+                "limit": SMARTRECRUITERS_PAGE_SIZE,
+                "offset": offset,
+                "destination": "PUBLIC",
+            },
+        )
+
+        if not isinstance(
+            data,
+            dict,
+        ):
+            break
+
+        content = data.get(
+            "content",
             [],
         )
 
-        results = []
+        if not isinstance(
+            content,
+            list,
+        ):
+            break
 
-        for job in jobs:
+        try:
+            total_found = int(
+                data.get(
+                    "totalFound",
+                    0,
+                )
+            )
+        except Exception:
+            total_found = None
+
+        if not content:
+            break
+
+        for job in content:
 
             title = clean_text(
-                job.get("title")
+                job.get("name")
+                or job.get("title")
             )
-
-            if not is_target_title(title):
-                continue
 
             location_obj = (
                 job.get("location")
                 or {}
             )
 
-            location = clean_text(
-                location_obj.get("name")
-            )
-
-            # Greenhouse doesn't provide a
-            # dedicated remote flag here.
-            remote = bool(
-                REMOTE_REGEX.search(
-                    location
+            city = clean_text(
+                location_obj.get(
+                    "city"
                 )
             )
 
-            country = classify_location(
-                location,
-                remote,
-            )
-
-            if country not in (
-                "India",
-                "USA",
-            ):
-                continue
-
-            posted = parse_date(
-                job.get("first_published")
-                or job.get("updated_at")
-            )
-
-            if not is_recent(posted):
-                continue
-
-            job_id = str(
-                job.get("id")
-                or ""
-            )
-
-            link = (
-                job.get("absolute_url")
-                or ""
-            )
-
-            results.append({
-                "ats": "greenhouse",
-                "company": slug,
-                "job_id": job_id,
-                "title": title,
-                "location": location,
-                "country": country,
-                "posted_date": posted,
-                "job_url": link,
-            })
-
-        return results
-
-    except Exception:
-        return []
-
-
-def fetch_ashby(slug):
-    url = (
-        ATS_SOURCES["ashby"]["api"]
-        .format(slug=slug)
-    )
-
-    try:
-        response = SESSION.get(
-            url,
-            timeout=30,
-        )
-
-        if response.status_code != 200:
-            return []
-
-        data = response.json()
-
-        jobs = data.get(
-            "jobs",
-            [],
-        )
-
-        results = []
-
-        for job in jobs:
-
-            # Only listed public postings.
-            if job.get(
-                "isListed",
-                True,
-            ) is False:
-                continue
-
-            title = clean_text(
-                job.get("title")
-            )
-
-            if not is_target_title(title):
-                continue
-
-            locations = []
-
-            primary = job.get(
-                "location"
-            )
-
-            if primary:
-                locations.append(
-                    clean_text(primary)
-                )
-
-            for secondary in (
-                job.get(
-                    "secondaryLocations"
-                )
-                or []
-            ):
-                if isinstance(
-                    secondary,
-                    dict,
-                ):
-                    loc = secondary.get(
-                        "location"
-                    )
-
-                    if loc:
-                        locations.append(
-                            clean_text(loc)
-                        )
-
-            location = ", ".join(
-                dict.fromkeys(
-                    locations
+            region = clean_text(
+                location_obj.get(
+                    "region"
                 )
             )
 
-            remote = bool(
-                job.get(
-                    "isRemote",
+            country_code = clean_text(
+                location_obj.get(
+                    "country"
+                )
+            )
+
+            remote_flag = bool(
+                location_obj.get(
+                    "remote",
                     False,
                 )
             )
 
-            country = classify_location(
-                location,
-                remote,
-            )
+            location_parts = [
+                city,
+                region,
+                country_code.upper()
+                if country_code
+                else "",
+            ]
 
-            if country not in (
-                "India",
-                "USA",
-            ):
-                continue
+            if remote_flag:
+                location_parts.insert(
+                    0,
+                    "Remote",
+                )
 
-            posted = parse_date(
-                job.get(
-                    "publishedAt"
+            location = ", ".join(
+                dict.fromkeys(
+                    x for x in location_parts
+                    if x
                 )
             )
 
-            if not is_recent(posted):
-                continue
-
-            job_id = str(
-                job.get("id")
-                or job.get("jobId")
-                or ""
-            )
-
-            link = (
-                job.get("jobUrl")
-                or job.get("applyUrl")
-                or ""
-            )
-
-            results.append({
-                "ats": "ashby",
-                "company": slug,
-                "job_id": job_id,
-                "title": title,
-                "location": location,
-                "country": country,
-                "posted_date": posted,
-                "job_url": link,
-            })
-
-        return results
-
-    except Exception:
-        return []
-
-
-def fetch_lever(slug):
-    url = (
-        ATS_SOURCES["lever"]["api"]
-        .format(slug=slug)
-    )
-
-    try:
-        response = SESSION.get(
-            url,
-            timeout=30,
-        )
-
-        if response.status_code != 200:
-            return []
-
-        data = response.json()
-
-        if not isinstance(
-            data,
-            list,
-        ):
-            return []
-
-        results = []
-
-        for job in data:
-
-            title = clean_text(
-                job.get("text")
-            )
-
-            if not is_target_title(title):
-                continue
-
-            categories = (
-                job.get("categories")
+            department_obj = (
+                job.get("department")
                 or {}
             )
 
-            location = clean_text(
-                categories.get(
-                    "location"
-                )
+            function_obj = (
+                job.get("function")
+                or {}
             )
 
-            workplace = clean_text(
-                job.get(
-                    "workplaceType"
-                )
-            )
-
-            remote = (
-                workplace.lower()
-                == "remote"
-                or bool(
-                    REMOTE_REGEX.search(
-                        location
+            metadata = " ".join([
+                clean_text(
+                    department_obj.get(
+                        "label"
                     )
-                )
-            )
+                ),
+                clean_text(
+                    function_obj.get(
+                        "label"
+                    )
+                ),
+            ])
+
+            if not is_relevant_job(
+                title,
+                metadata,
+            ):
+                continue
 
             country = classify_location(
                 location,
-                remote,
+                remote_flag,
+                country_code,
             )
 
             if country not in (
@@ -951,34 +1852,30 @@ def fetch_lever(slug):
             ):
                 continue
 
-            posted = parse_date(
-                job.get(
-                    "createdAt"
-                )
-            )
-
-            if not is_recent(posted):
-                continue
+            posted = ""
 
             job_id = str(
                 job.get("id")
+                or job.get("uuid")
                 or ""
             )
 
-            urls = (
-                job.get("urls")
-                or {}
+            ref = clean_text(
+                job.get("ref")
             )
 
             link = (
-                urls.get("show")
-                or job.get("hostedUrl")
-                or job.get("applyUrl")
-                or ""
+                f"https://careers.smartrecruiters.com/"
+                f"{slug}/{job_id}"
+                if job_id
+                else ref
             )
 
+            if not link:
+                continue
+
             results.append({
-                "ats": "lever",
+                "ats": "smartrecruiters",
                 "company": slug,
                 "job_id": job_id,
                 "title": title,
@@ -988,16 +1885,31 @@ def fetch_lever(slug):
                 "job_url": link,
             })
 
-        return results
+        offset += len(content)
 
-    except Exception:
-        return []
+        if (
+            total_found is not None
+            and offset >= total_found
+        ):
+            break
+
+        if len(content) < (
+            SMARTRECRUITERS_PAGE_SIZE
+        ):
+            break
+
+        if offset > 100000:
+            break
+
+    return results
 
 
 FETCHERS = {
     "greenhouse": fetch_greenhouse,
     "ashby": fetch_ashby,
     "lever": fetch_lever,
+    "workable": fetch_workable,
+    "smartrecruiters": fetch_smartrecruiters,
 }
 
 
@@ -1010,14 +1922,11 @@ def discover_all_boards():
 
     for ats in ATS_SOURCES:
 
-        candidates = discover_boards_for_ats(
-            ats
+        candidates = (
+            discover_boards_for_ats(
+                ats
+            )
         )
-
-        # Safety limit for an individual discovery
-        # operation is intentionally not applied here.
-        #
-        # We want maximum board discovery.
 
         valid = validate_boards(
             ats,
@@ -1033,8 +1942,9 @@ def discover_all_boards():
 # CRAWL ALL BOARDS
 # ============================================================
 
-def crawl_boards(boards):
-
+def crawl_boards(
+    boards,
+):
     all_jobs = []
 
     tasks = []
@@ -1090,9 +2000,10 @@ def crawl_boards(boards):
             try:
                 jobs = future.result()
 
-                all_jobs.extend(
-                    jobs
-                )
+                if jobs:
+                    all_jobs.extend(
+                        jobs
+                    )
 
             except Exception as exc:
                 print(
@@ -1117,8 +2028,9 @@ def crawl_boards(boards):
 # DEDUPLICATION
 # ============================================================
 
-def deduplicate_jobs(jobs):
-
+def deduplicate_jobs(
+    jobs,
+):
     unique = {}
 
     for job in jobs:
@@ -1130,7 +2042,9 @@ def deduplicate_jobs(jobs):
         )
 
         if job_key not in unique:
-            unique[job_key] = job
+            unique[
+                job_key
+            ] = job
 
     return list(
         unique.values()
@@ -1144,18 +2058,18 @@ def deduplicate_jobs(jobs):
 def load_existing_keys(
     worksheet,
 ):
-
     existing = set()
 
     try:
-        rows = worksheet.get_all_values()
+        rows = (
+            worksheet.get_all_values()
+        )
 
         if not rows:
             return existing
 
         headers = rows[0]
 
-        # We expect Job ID and ATS columns.
         try:
             ats_index = headers.index(
                 "ATS"
@@ -1223,11 +2137,11 @@ def load_existing_keys(
 # WRITE TO GOOGLE SHEETS
 # ============================================================
 
-def save_jobs(jobs):
-
+def save_jobs(
+    jobs,
+):
     worksheet = get_google_sheet()
 
-    # Desired columns.
     headers = [
         "Company",
         "Job Title",
@@ -1239,7 +2153,9 @@ def save_jobs(jobs):
         "Job ID",
     ]
 
-    existing_values = worksheet.get_all_values()
+    existing_values = (
+        worksheet.get_all_values()
+    )
 
     if not existing_values:
 
@@ -1249,12 +2165,11 @@ def save_jobs(jobs):
 
     elif existing_values[0] != headers:
 
-        # If the current Jobs sheet has another header
-        # structure, preserve existing data and only use
-        # the current structure when empty.
         print(
-            "Existing Jobs sheet has a different "
-            "header structure."
+            "Existing Jobs sheet has a "
+            "different header structure. "
+            "Existing data will not be "
+            "deleted."
         )
 
     existing_keys = (
@@ -1268,7 +2183,8 @@ def save_jobs(jobs):
     for job in jobs:
 
         id_key = (
-            f"{job['ats']}:{job['job_id']}"
+            f"{job['ats']}:"
+            f"{job['job_id']}"
             if job["job_id"]
             else ""
         )
@@ -1344,16 +2260,28 @@ def main():
     print(
         "========================================"
     )
+
     print(
         "REMOTE4.ME JOB CRAWLER"
     )
+
     print(
         "========================================"
     )
 
     print(
-        f"Started: {started.isoformat()}"
+        f"Started: "
+        f"{started.isoformat()}"
     )
+
+    print(
+        "\nATS:"
+    )
+
+    for ats in ATS_SOURCES:
+        print(
+            f"  {ats}"
+        )
 
     print(
         "\nNiche:"
@@ -1362,9 +2290,11 @@ def main():
     print(
         "  Customer Support"
     )
+
     print(
         "  Technical Support"
     )
+
     print(
         "  Customer Success"
     )
@@ -1376,6 +2306,7 @@ def main():
     print(
         "  India"
     )
+
     print(
         "  USA"
     )
@@ -1385,10 +2316,13 @@ def main():
     # --------------------------------------------------------
 
     print(
-        "\nSTEP 1 — Discovering ATS boards"
+        "\nSTEP 1 — "
+        "Discovering ATS boards"
     )
 
-    boards = discover_all_boards()
+    boards = (
+        discover_all_boards()
+    )
 
     total_boards = sum(
         len(x)
@@ -1403,13 +2337,15 @@ def main():
     for ats, slugs in boards.items():
 
         print(
-            f"  {ats}: {len(slugs)}"
+            f"  {ats}: "
+            f"{len(slugs)}"
         )
 
     if total_boards == 0:
 
         print(
-            "\nNo live ATS boards were discovered."
+            "\nNo live ATS boards "
+            "were discovered."
         )
 
         return
@@ -1419,7 +2355,8 @@ def main():
     # --------------------------------------------------------
 
     print(
-        "\nSTEP 2 — Crawling jobs"
+        "\nSTEP 2 — "
+        "Crawling jobs"
     )
 
     jobs = crawl_boards(
@@ -1428,7 +2365,8 @@ def main():
 
     print(
         f"\nMatching jobs before "
-        f"deduplication: {len(jobs)}"
+        f"deduplication: "
+        f"{len(jobs)}"
     )
 
     # --------------------------------------------------------
@@ -1436,7 +2374,8 @@ def main():
     # --------------------------------------------------------
 
     print(
-        "\nSTEP 3 — Deduplicating"
+        "\nSTEP 3 — "
+        "Deduplicating"
     )
 
     jobs = deduplicate_jobs(
@@ -1444,7 +2383,8 @@ def main():
     )
 
     print(
-        f"Unique jobs: {len(jobs)}"
+        f"Unique jobs: "
+        f"{len(jobs)}"
     )
 
     # --------------------------------------------------------
@@ -1452,7 +2392,8 @@ def main():
     # --------------------------------------------------------
 
     print(
-        "\nSTEP 4 — Updating Google Sheets"
+        "\nSTEP 4 — "
+        "Updating Google Sheets"
     )
 
     added = save_jobs(
@@ -1480,11 +2421,13 @@ def main():
     )
 
     print(
-        f"New jobs added: {added}"
+        f"New jobs added: "
+        f"{added}"
     )
 
     print(
-        f"Runtime: {duration:.1f} seconds"
+        f"Runtime: "
+        f"{duration:.1f} seconds"
     )
 
     print(
