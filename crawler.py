@@ -2043,6 +2043,31 @@ def load_board_cache(worksheet):
     return cache
 
 
+def parse_datetime_utc(value):
+    """Parse an ISO timestamp and always return a UTC-aware datetime.
+
+    Google Sheets may return older timestamps without a timezone while new
+    crawler timestamps are timezone-aware. Normalizing both prevents Python's
+    offset-naive vs offset-aware comparison error.
+    """
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(
+            str(value).strip().replace("Z", "+00:00")
+        )
+    except Exception:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+
+    return parsed
+
+
 def board_cache_is_fresh(cache):
     if not cache:
         return False
@@ -2058,16 +2083,14 @@ def board_cache_is_fresh(cache):
         if not item.get("active", True):
             continue
 
-        value = item.get("last_validated", "")
+        validated = parse_datetime_utc(
+            item.get("last_validated", "")
+        )
 
-        try:
-            dates.append(
-                datetime.fromisoformat(
-                    value.replace("Z", "+00:00")
-                )
-            )
-        except Exception:
+        if validated is None:
             return False
+
+        dates.append(validated)
 
     if not dates:
         return False
@@ -2210,15 +2233,11 @@ def save_board_cache(
 
 
 def board_needs_revalidation(item):
-    value = item.get("last_validated", "")
-    if not value:
-        return True
+    validated = parse_datetime_utc(
+        item.get("last_validated", "")
+    )
 
-    try:
-        validated = datetime.fromisoformat(
-            value.replace("Z", "+00:00")
-        )
-    except Exception:
+    if validated is None:
         return True
 
     return validated < (
