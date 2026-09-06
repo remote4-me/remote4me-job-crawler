@@ -1311,6 +1311,18 @@ def classify_workplace(
       hybrid
       onsite
       unknown
+
+    IMPORTANT:
+      Workplace classification is intentionally exact/conservative.
+
+      Priority:
+        1. ATS structured workplace type
+        2. ATS remote flag
+        3. Explicit remote/hybrid wording in the LOCATION field
+
+      The job title and job description are NOT used to classify a job
+      as remote or hybrid. This prevents false positives where an
+      onsite job mentions "remote" in its description or title.
     """
 
     workplace = clean_text(
@@ -1331,23 +1343,14 @@ def classify_workplace(
     if remote_flag:
         return "remote"
 
-    if has_remote_word(location):
-        return "remote"
-
+    # Only the actual ATS location field can provide an unstructured
+    # remote/hybrid signal. Do not infer workplace from title or
+    # description.
     if has_hybrid_word(location):
         return "hybrid"
 
-    if description:
-
-        # Prefer an explicit workplace phrase near the start
-        # of the description, while avoiding broad text matches.
-        head = description[:5000]
-
-        if has_hybrid_word(head):
-            return "hybrid"
-
-        if has_remote_word(head):
-            return "remote"
+    if has_remote_word(location):
+        return "remote"
 
     return "unknown"
 
