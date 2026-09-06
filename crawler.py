@@ -40,8 +40,11 @@ from google.oauth2.service_account import Credentials
 #   - Direct job URL required
 #   - Strong duplicate protection
 #   - Persistent ATS board cache in Google Sheets
-#   - Discovery/validation is refreshed periodically instead
-#     of repeating expensive work every day
+#   - Internet Archive/Common Crawl discovery runs every day
+#   - Newly discovered boards are validated directly against
+#     the ATS before being added to Boards
+#   - Every active board is scanned directly through its ATS API
+#     every day for fresh jobs
 #   - Daily jobs are limited to a recent publication window
 #
 # The GitHub Actions workflow should run this file at:
@@ -67,8 +70,8 @@ CONCURRENCY = 16
 # importing months of old jobs.
 MAX_JOB_AGE_DAYS = 7
 
-# Board discovery cache lifetime.
-# Boards are discovered/validated again after this many days.
+# Board discovery refresh interval for re-validating existing boards.
+# Internet Archive discovery itself runs EVERY day.
 # The Boards sheet persists between GitHub Actions runs.
 BOARD_CACHE_DAYS = 7
 
@@ -1855,6 +1858,7 @@ BOARD_HEADERS = [
     "Last Validated",
     "Failures",
     "Active",
+    "Discovery Source",
 ]
 
 
@@ -2013,122 +2017,203 @@ def board_cache_is_fresh(
 def save_board_cache(
     worksheet,
     boards,
+    existing_cache=None,
+    discovery_sources=None,
 ):
-    rows = [
-        BOARD_HEADERS
-    ]
+    """Merge live boards into the persistent Boards sheet.
 
-    today = (
-        datetime.now(
-            timezone.utc
-        ).date().isoformat()
-    )
+    Boards are keyed by (ATS, slug), so rediscovery never creates
+    duplicates. Existing boards are retained unless explicitly marked
+    inactive in the sheet.
+    """
+    existing_cache = existing_cache or {}
+    discovery_sources = discovery_sources or {}
 
-    for ats in sorted(
-        boards
-    ):
+    today = datetime.now(timezone.utc).date().isoformat()
+    merged = {}
 
-        for slug in sorted(
-            boards[ats],
-            key=str.lower,
-        ):
-            rows.append([
-                ats,
-                slug,
-                today,
-                0,
-                "Yes",
-            ])
+    # Keep existing active boards.
+    for key, item in existing_cache.items():
+        merged[key] = {
+            "ats": item.get("ats", ""),
+            "slug": item.get("slug", ""),
+            "last_validated": item.get("last_validated", ""),
+            "failures": item.get("failures", 0),
+            "active": True,
+            "discovery_source": item.get("discovery_source", "Existing"),
+        }
+
+    # Add/update boards confirmed by the ATS today.
+    for ats, slugs in boards.items():
+        for slug in slugs:
+            key = (ats, slug)
+            old = merged.get(key, {})
+            merged[key] = {
+                "ats": ats,
+                "slug": slug,
+                "last_validated": today,
+                "failures": 0,
+                "active": True,
+                "discovery_source": (
+                    discovery_sources.get(key)
+                    or old.get("discovery_source")
+                    or "Internet Archive"
+                ),
+            }
+
+    rows = [BOARD_HEADERS]
+
+    for key in sorted(merged, key=lambda x: (x[0].lower(), x[1].lower())):
+        item = merged[key]
+        rows.append([
+            item["ats"],
+            item["slug"],
+            item["last_validated"],
+            item["failures"],
+            "Yes" if item["active"] else "No",
+            item["discovery_source"],
+        ])
 
     try:
         worksheet.clear()
-
         worksheet.update(
             "A1",
             rows,
             value_input_option="RAW",
         )
-
         print(
-            f"Saved {len(rows) - 1} "
-            f"live boards to Boards sheet."
+            f"Saved {len(rows) - 1} unique live boards to Boards sheet."
         )
-
     except Exception as exc:
-        print(
-            f"Could not save board cache: "
-            f"{exc}"
+        print(f"Could not save board cache: {exc}")
+
+
+def board_needs_revalidation(item):
+    value = item.get("last_validated", "")
+    if not value:
+        return True
+
+    try:
+        validated = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
         )
+    except Exception:
+        return True
+
+    return validated < (
+        datetime.now(timezone.utc)
+        - timedelta(days=BOARD_CACHE_DAYS)
+    )
 
 
-def discover_or_load_boards(
-    spreadsheet,
-):
+def discover_or_load_boards(spreadsheet):
+    """Run daily discovery, then use the ATS as the source of truth.
+
+    Flow:
+      1. Load existing Boards.
+      2. Scan Internet Archive/Common Crawl every day for ATS board slugs.
+      3. Skip duplicate (ATS, slug) candidates already in Boards.
+      4. Validate new candidates directly against the ATS.
+      5. Revalidate old boards only when their validation is stale.
+      6. Merge confirmed boards into Boards without duplicating them.
+      7. Return all active boards for the direct daily ATS job crawl.
+
+    There is intentionally no assumption that an ATS provides a global
+    company directory. Greenhouse/Ashby/Lever/Workable public APIs are
+    board-level APIs, so a board slug must first be discovered or already
+    known. Once known, the ATS itself is the authoritative source for jobs.
+    """
     boards_sheet = get_or_create_worksheet(
         spreadsheet,
         "Boards",
-        rows=5000,
-        cols=5,
+        rows=10000,
+        cols=len(BOARD_HEADERS),
     )
 
-    cache = load_board_cache(
-        boards_sheet
-    )
+    existing_cache = load_board_cache(boards_sheet)
+    print(f"\nExisting unique Boards entries: {len(existing_cache)}")
 
-    if board_cache_is_fresh(
-        cache
-    ):
-        boards = {}
+    # --------------------------------------------------------
+    # DAILY INTERNET ARCHIVE / COMMON CRAWL DISCOVERY
+    # --------------------------------------------------------
+    discovered = {ats: set() for ats in ATS_SOURCES}
+    discovery_sources = {}
 
-        for item in cache.values():
-            boards.setdefault(
-                item["ats"],
-                [],
-            ).append(
-                item["slug"]
-            )
-
-        print(
-            "\nUsing cached live boards."
-        )
-
-        for ats in ATS_SOURCES:
-            print(
-                f"  {ats}: "
-                f"{len(boards.get(ats, []))}"
-            )
-
-        return boards
-
-    print(
-        "\nBoard cache is empty or "
-        "older than "
-        f"{BOARD_CACHE_DAYS} days."
-    )
-
-    boards = {}
+    print("\nDaily board discovery — Internet Archive first")
 
     for ats in ATS_SOURCES:
+        candidates = discover_boards_for_ats(ats)
+        discovered[ats].update(candidates)
 
-        candidates = (
-            discover_boards_for_ats(
-                ats
+        for slug in candidates:
+            key = (ats, slug)
+            discovery_sources[key] = "Internet Archive/Common Crawl"
+
+    # --------------------------------------------------------
+    # VALIDATE ONLY NEW / STALE BOARDS AGAINST THE ATS
+    # --------------------------------------------------------
+    boards = {ats: set() for ats in ATS_SOURCES}
+    candidates_to_validate = {ats: set() for ats in ATS_SOURCES}
+
+    for ats in ATS_SOURCES:
+        for slug in discovered[ats]:
+            key = (ats, slug)
+            if key not in existing_cache:
+                candidates_to_validate[ats].add(slug)
+            else:
+                # A board already in Boards is not a duplicate. It is
+                # still revalidated periodically to confirm it remains live.
+                if board_needs_revalidation(existing_cache[key]):
+                    candidates_to_validate[ats].add(slug)
+                else:
+                    boards[ats].add(slug)
+
+    # Existing boards always remain in the daily crawl set.
+    # Internet Archive discovery is a discovery signal, not the source
+    # of truth for whether a previously known ATS board should be scanned.
+    # This prevents an archive miss from making a live company disappear.
+    for key, item in existing_cache.items():
+        ats, slug = key
+        if ats in boards and item.get("active", True):
+            boards[ats].add(slug)
+
+    total_new_candidates = sum(
+        len(values) for values in candidates_to_validate.values()
+    )
+    print(f"\nNew/stale board candidates requiring direct ATS validation: {total_new_candidates}")
+
+    for ats in ATS_SOURCES:
+        candidates = sorted(candidates_to_validate[ats], key=str.lower)
+        if not candidates:
+            continue
+
+        valid = validate_boards(ats, candidates)
+        for slug in valid:
+            boards[ats].add(slug)
+            discovery_sources[(ats, slug)] = (
+                "Internet Archive/Common Crawl"
+                if slug in discovered[ats]
+                else "ATS"
             )
-        )
 
-        boards[ats] = (
-            validate_boards(
-                ats,
-                candidates,
-            )
-        )
-
+    # Save merged unique board set. Existing boards are retained; only
+    # ATS-confirmed new boards are added.
     save_board_cache(
         boards_sheet,
         boards,
+        existing_cache=existing_cache,
+        discovery_sources=discovery_sources,
     )
 
-    return boards
+    print("\nDirect ATS crawl will now scan every active board daily.")
+
+    for ats in ATS_SOURCES:
+        print(f"  {ats}: {len(boards.get(ats, set()))}")
+
+    return {
+        ats: sorted(values, key=str.lower)
+        for ats, values in boards.items()
+    }
 
 
 # ============================================================
