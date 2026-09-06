@@ -13,36 +13,39 @@ from google.oauth2.service_account import Credentials
 
 
 # ============================================================
-# REMOTE4.ME JOB CRAWLER
+# REMOTE4.ME JOB CRAWLER — QUALITY / DAILY VERSION
 # ============================================================
 #
-# Purpose:
-#   Automatically discover public ATS boards and collect
-#   relevant REMOTE jobs for Remote4.me.
+# Scope:
+#   - Customer Support
+#   - Technical Support
+#   - Customer Success
+#   - Customer Experience
+#   - Customer Service
+#   - Onboarding / Implementation / Enablement
+#   - Closely related support roles
 #
-# Focus:
-#   Customer Support
-#   Technical Support
-#   Customer Success
-#
-# Countries:
-#   India
-#   USA
+# Locations:
+#   - USA: REMOTE only
+#   - India: REMOTE + HYBRID
 #
 # ATS:
-#   Greenhouse
-#   Ashby
-#   Lever
-#   Workable
+#   - Greenhouse
+#   - Ashby
+#   - Lever
+#   - Workable
 #
-# Important:
-#   - SmartRecruiters has been removed.
-#   - Only remote jobs are accepted.
-#   - Only India/USA jobs are accepted.
-#   - Jobs older than MAX_JOB_AGE_DAYS are skipped.
-#   - Jobs already present in Google Sheets are skipped.
-#   - Added Date is written as the first column.
+# Design goals:
+#   - High relevance, low junk
+#   - Direct job URL required
+#   - Strong duplicate protection
+#   - Persistent ATS board cache in Google Sheets
+#   - Discovery/validation is refreshed periodically instead
+#     of repeating expensive work every day
+#   - Daily jobs are limited to a recent publication window
 #
+# The GitHub Actions workflow should run this file at:
+#   19:00 IST = 13:30 UTC
 # ============================================================
 
 
@@ -50,40 +53,43 @@ from google.oauth2.service_account import Credentials
 # CONFIGURATION
 # ============================================================
 
-SPREADSHEET_ID = os.environ.get(
-    "SPREADSHEET_ID",
-    "",
-)
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
+GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
 
-GOOGLE_CREDENTIALS = os.environ.get(
-    "GOOGLE_CREDENTIALS",
-    "",
-)
+# Higher concurrency reduces the ~20 minute runtime seen with
+# thousands of boards. 16 is a compromise between speed and
+# public-API friendliness.
+CONCURRENCY = 16
 
-# Moderate concurrency for public ATS endpoints.
-CONCURRENCY = 8
-
-# IMPORTANT:
-# Your first crawl produced ~11,000 jobs because 30 days
-# was being scanned across thousands of boards.
-#
-# With a daily crawler, 7 days is a much more practical window.
+# Daily crawl window.
+# Because the crawler runs every day and deduplicates against the
+# Sheet, 7 days gives a useful safety buffer without repeatedly
+# importing months of old jobs.
 MAX_JOB_AGE_DAYS = 7
 
-# 0 = crawl every discovered live board.
+# Board discovery cache lifetime.
+# Boards are discovered/validated again after this many days.
+# The Boards sheet persists between GitHub Actions runs.
+BOARD_CACHE_DAYS = 7
+
+# 0 = crawl every cached live board.
 MAX_BOARDS_PER_RUN = 0
 
-# Refresh board discovery every run.
-REFRESH_BOARDS = True
+# If a cached board has failed repeatedly, it can be removed on
+# the next discovery refresh. This avoids carrying dead boards.
+MAX_BOARD_FAILURES = 3
 
-# Google Sheet tab.
-JOBS_SHEET_NAME = "Jobs"
+USER_AGENT = "Remote4.me Job Crawler/3.0"
 
-# Date format used in the Added Date column.
-DATE_FORMAT = "%Y-%m-%d"
-
-# Public HTTP user agent.
-USER_AGENT = "Remote4.me Job Crawler/4.0"
+SMART_RETRY_STATUS_CODES = {
+    408,
+    425,
+    429,
+    500,
+    502,
+    503,
+    504,
+}
 
 
 # ============================================================
@@ -121,6 +127,10 @@ ATS_SOURCES = {
             "https://api.lever.co/"
             "v0/postings/{slug}?mode=json"
         ),
+        "eu_api": (
+            "https://api.eu.lever.co/"
+            "v0/postings/{slug}?mode=json"
+        ),
     },
 
     "workable": {
@@ -136,39 +146,28 @@ ATS_SOURCES = {
 
 
 # ============================================================
-# TARGET JOB TITLES
+# HIGH-COVERAGE, TITLE-FOCUSED ROLE KEYWORDS
 # ============================================================
 #
-# These are intentionally title-based.
-#
-# We do NOT use standalone words such as:
+# Do NOT add standalone words such as:
 #   support
 #   success
-#   manager
+#   service
 #   specialist
+#   manager
 #   operations
 #
-# because those create too much unrelated content.
+# by themselves. They create large amounts of junk.
 #
+# The patterns below deliberately use meaningful combinations.
 # ============================================================
 
 TARGET_TITLE_PATTERNS = [
 
     # --------------------------------------------------------
-    # CUSTOMER SUPPORT / CUSTOMER SERVICE
+    # CUSTOMER SUPPORT
     # --------------------------------------------------------
     r"\bcustomer support\b",
-    r"\bcustomer service\b",
-    r"\bcustomer care\b",
-    r"\bcustomer assistance\b",
-    r"\bcustomer advocate\b",
-    r"\bcustomer advocacy\b",
-    r"\bcustomer experience\b",
-    r"\bcustomer experience specialist\b",
-    r"\bcustomer experience associate\b",
-    r"\bcustomer experience representative\b",
-    r"\bcustomer experience advisor\b",
-    r"\bcustomer experience agent\b",
     r"\bcustomer support specialist\b",
     r"\bcustomer support associate\b",
     r"\bcustomer support representative\b",
@@ -177,86 +176,154 @@ TARGET_TITLE_PATTERNS = [
     r"\bcustomer support consultant\b",
     r"\bcustomer support coordinator\b",
     r"\bcustomer support analyst\b",
+    r"\bcustomer support executive\b",
+    r"\bcustomer support manager\b",
+    r"\bcustomer support lead\b",
+    r"\bcustomer support supervisor\b",
+    r"\bcustomer support director\b",
+    r"\bhead of customer support\b",
+    r"\bglobal customer support\b",
+    r"\binternational customer support\b",
+    r"\bcustomer technical support\b",
+
+    # --------------------------------------------------------
+    # CUSTOMER SERVICE
+    # --------------------------------------------------------
+    r"\bcustomer service\b",
     r"\bcustomer service specialist\b",
     r"\bcustomer service associate\b",
     r"\bcustomer service representative\b",
     r"\bcustomer service agent\b",
     r"\bcustomer service advisor\b",
+    r"\bcustomer service consultant\b",
     r"\bcustomer service coordinator\b",
+    r"\bcustomer service analyst\b",
+    r"\bcustomer service executive\b",
+    r"\bcustomer service manager\b",
+    r"\bcustomer service lead\b",
+    r"\bcustomer service supervisor\b",
+    r"\bcustomer service director\b",
+    r"\bhead of customer service\b",
+
+    # --------------------------------------------------------
+    # CUSTOMER CARE
+    # --------------------------------------------------------
+    r"\bcustomer care\b",
     r"\bcustomer care specialist\b",
     r"\bcustomer care associate\b",
     r"\bcustomer care representative\b",
     r"\bcustomer care agent\b",
+    r"\bcustomer care advisor\b",
+    r"\bcustomer care manager\b",
+    r"\bcustomer care lead\b",
+
+    # --------------------------------------------------------
+    # CUSTOMER EXPERIENCE
+    # --------------------------------------------------------
+    r"\bcustomer experience\b",
+    r"\bcustomer experience specialist\b",
+    r"\bcustomer experience associate\b",
+    r"\bcustomer experience representative\b",
+    r"\bcustomer experience advisor\b",
+    r"\bcustomer experience manager\b",
+    r"\bcustomer experience lead\b",
+    r"\bcustomer experience analyst\b",
+    r"\bcustomer experience operations\b",
+    r"\bhead of customer experience\b",
+    r"\bcustomer experience director\b",
+
+    # --------------------------------------------------------
+    # CLIENT / USER / MEMBER SUPPORT
+    # --------------------------------------------------------
     r"\bclient support\b",
     r"\bclient support specialist\b",
     r"\bclient support associate\b",
     r"\bclient support representative\b",
     r"\bclient support agent\b",
+    r"\bclient support manager\b",
+    r"\bclient service\b",
     r"\bclient services\b",
-    r"\bclient service specialist\b",
-    r"\bclient service representative\b",
-    r"\bmember support\b",
-    r"\bmember support specialist\b",
-    r"\bmember support associate\b",
-    r"\bmember services\b",
+    r"\bclient services specialist\b",
+    r"\bclient services associate\b",
+    r"\bclient services representative\b",
+    r"\bclient services manager\b",
     r"\buser support\b",
     r"\buser support specialist\b",
     r"\buser support associate\b",
     r"\buser support representative\b",
+    r"\buser support agent\b",
+    r"\buser support manager\b",
     r"\buser services\b",
-    r"\buser experience support\b",
+    r"\buser services specialist\b",
+    r"\bmember support\b",
+    r"\bmember support specialist\b",
+    r"\bmember support associate\b",
+    r"\bmember services\b",
+    r"\bmember services specialist\b",
+
+    # --------------------------------------------------------
+    # COMMUNITY / PARTNER / MERCHANT SUPPORT
+    # --------------------------------------------------------
     r"\bcommunity support\b",
     r"\bcommunity support specialist\b",
-    r"\bcommunity support associate\b",
+    r"\bcommunity support manager\b",
+    r"\bcommunity operations\b",
     r"\bpartner support\b",
     r"\bpartner support specialist\b",
-    r"\bpartner support associate\b",
-    r"\bvendor support\b",
+    r"\bpartner support manager\b",
+    r"\bpartner services\b",
     r"\bmerchant support\b",
     r"\bmerchant support specialist\b",
+    r"\bmerchant support representative\b",
+    r"\bmerchant success\b",
     r"\bseller support\b",
     r"\bseller support specialist\b",
+    r"\bvendor support\b",
+    r"\bvendor support specialist\b",
     r"\bprovider support\b",
     r"\bprovider support specialist\b",
-    r"\bmember experience\b",
-    r"\bmember experience specialist\b",
-    r"\bmember experience associate\b",
-    r"\bclient experience\b",
-    r"\bclient experience specialist\b",
-    r"\bclient experience associate\b",
-    r"\bcustomer operations\b",
-    r"\bcustomer operations specialist\b",
-    r"\bcustomer operations associate\b",
-    r"\bcustomer operations analyst\b",
-    r"\bclient operations\b",
-    r"\bclient operations specialist\b",
-    r"\bclient operations associate\b",
-    r"\bsupport operations\b",
-    r"\bsupport operations specialist\b",
-    r"\bsupport operations associate\b",
-    r"\bsupport operations analyst\b",
-    r"\bsupport coordinator\b",
+
+    # --------------------------------------------------------
+    # GENERAL SUPPORT
+    # --------------------------------------------------------
     r"\bsupport specialist\b",
     r"\bsupport associate\b",
     r"\bsupport representative\b",
     r"\bsupport agent\b",
     r"\bsupport advisor\b",
     r"\bsupport consultant\b",
+    r"\bsupport coordinator\b",
     r"\bsupport analyst\b",
     r"\bsupport executive\b",
     r"\bsupport administrator\b",
-    r"\bsupport administrator\b",
     r"\bsupport lead\b",
-    r"\bsupport supervisor\b",
     r"\bsupport manager\b",
-    r"\bcustomer support manager\b",
-    r"\bcustomer service manager\b",
-    r"\bcustomer care manager\b",
-    r"\bclient support manager\b",
-    r"\bmember support manager\b",
+    r"\bsupport supervisor\b",
+    r"\bsupport operations\b",
+    r"\bsupport operations specialist\b",
+    r"\bsupport operations associate\b",
+    r"\bsupport operations analyst\b",
+    r"\bsupport operations manager\b",
+    r"\bsupport program manager\b",
+    r"\bsupport enablement\b",
+    r"\bsupport quality\b",
+    r"\bsupport quality analyst\b",
+    r"\bsupport quality specialist\b",
+    r"\bsupport trainer\b",
+    r"\bsupport training specialist\b",
+    r"\bsupport workforce\b",
+    r"\bsupport workforce analyst\b",
+    r"\bsupport workforce manager\b",
+    r"\bescalation support\b",
+    r"\bescalations specialist\b",
+    r"\bescalations manager\b",
+    r"\bescalation specialist\b",
+    r"\bescalation manager\b",
+    r"\btechnical escalation\b",
+    r"\bincident support\b",
 
     # --------------------------------------------------------
-    # TECHNICAL / PRODUCT / APPLICATION SUPPORT
+    # TECHNICAL SUPPORT
     # --------------------------------------------------------
     r"\btechnical support\b",
     r"\btechnical support specialist\b",
@@ -265,36 +332,54 @@ TARGET_TITLE_PATTERNS = [
     r"\btechnical support agent\b",
     r"\btechnical support advisor\b",
     r"\btechnical support consultant\b",
+    r"\btechnical support coordinator\b",
     r"\btechnical support analyst\b",
     r"\btechnical support engineer\b",
     r"\btechnical support lead\b",
     r"\btechnical support manager\b",
+    r"\btechnical support supervisor\b",
+    r"\btechnical support director\b",
+    r"\bhead of technical support\b",
     r"\btechnical customer support\b",
     r"\btechnical customer service\b",
+    r"\btechnical assistance specialist\b",
     r"\btechnical assistance\b",
     r"\btechnical helpdesk\b",
     r"\btechnical help desk\b",
+    r"\btechnical service desk\b",
+
+    # --------------------------------------------------------
+    # PRODUCT SUPPORT
+    # --------------------------------------------------------
     r"\bproduct support\b",
     r"\bproduct support specialist\b",
     r"\bproduct support associate\b",
     r"\bproduct support representative\b",
     r"\bproduct support agent\b",
-    r"\bproduct support engineer\b",
+    r"\bproduct support advisor\b",
     r"\bproduct support analyst\b",
+    r"\bproduct support engineer\b",
     r"\bproduct support consultant\b",
     r"\bproduct support manager\b",
+    r"\bproduct support lead\b",
+    r"\bproduct support operations\b",
+
+    # --------------------------------------------------------
+    # SOFTWARE / APPLICATION / PLATFORM SUPPORT
+    # --------------------------------------------------------
     r"\bsoftware support\b",
     r"\bsoftware support specialist\b",
     r"\bsoftware support associate\b",
     r"\bsoftware support representative\b",
     r"\bsoftware support engineer\b",
     r"\bsoftware support analyst\b",
+    r"\bsoftware support manager\b",
     r"\bapplication support\b",
     r"\bapplication support specialist\b",
     r"\bapplication support associate\b",
     r"\bapplication support analyst\b",
     r"\bapplication support engineer\b",
-    r"\bapplication support consultant\b",
+    r"\bapplication support manager\b",
     r"\bplatform support\b",
     r"\bplatform support specialist\b",
     r"\bplatform support associate\b",
@@ -304,89 +389,102 @@ TARGET_TITLE_PATTERNS = [
     r"\bapi support\b",
     r"\bapi support specialist\b",
     r"\bapi support engineer\b",
+    r"\bintegration support\b",
+    r"\bintegration support specialist\b",
+    r"\bintegration support engineer\b",
     r"\bdeveloper support\b",
     r"\bdeveloper support specialist\b",
     r"\bdeveloper support engineer\b",
-    r"\bdeveloper support representative\b",
-    r"\btechnical account support\b",
-    r"\btechnical account specialist\b",
-    r"\btechnical account manager\b",
-    r"\btechnical account support specialist\b",
-    r"\btechnical success\b",
-    r"\btechnical customer success\b",
-    r"\btechnical services support\b",
-    r"\btechnical solutions support\b",
-    r"\btechnical solutions specialist\b",
-    r"\btechnical services specialist\b",
-    r"\bservice desk\b",
-    r"\bservice desk analyst\b",
-    r"\bservice desk specialist\b",
-    r"\bservice desk engineer\b",
-    r"\bservice desk representative\b",
+    r"\bdeveloper experience support\b",
+
+    # --------------------------------------------------------
+    # IT / HELP DESK / SERVICE DESK
+    # --------------------------------------------------------
+    r"\bit support\b",
+    r"\bit support specialist\b",
+    r"\bit support associate\b",
+    r"\bit support representative\b",
+    r"\bit support engineer\b",
+    r"\bit support analyst\b",
+    r"\bit support technician\b",
+    r"\bit support manager\b",
+    r"\bit help desk\b",
     r"\bhelp desk\b",
     r"\bhelpdesk\b",
     r"\bhelp desk specialist\b",
     r"\bhelp desk analyst\b",
-    r"\bhelp desk engineer\b",
     r"\bhelp desk technician\b",
-    r"\bhelpdesk specialist\b",
-    r"\bit support\b",
-    r"\bit support specialist\b",
-    r"\bit support associate\b",
-    r"\bit support engineer\b",
-    r"\bit support analyst\b",
-    r"\bit support technician\b",
+    r"\bhelp desk engineer\b",
+    r"\bhelp desk manager\b",
+    r"\bservice desk\b",
+    r"\bservice desk specialist\b",
+    r"\bservice desk analyst\b",
+    r"\bservice desk technician\b",
+    r"\bservice desk engineer\b",
+    r"\bservice desk manager\b",
     r"\bit service desk\b",
-    r"\btechnical support technician\b",
-    r"\bsupport technician\b",
-    r"\bsupport engineer\b",
-    r"\bsupport engineering\b",
-    r"\bescalation support\b",
-    r"\bsupport escalation\b",
-    r"\bsupport escalation specialist\b",
-    r"\bescalation specialist\b",
-    r"\bescalations specialist\b",
-    r"\btechnical escalation\b",
-    r"\btechnical escalation specialist\b",
-    r"\btechnical escalation engineer\b",
 
     # --------------------------------------------------------
-    # CUSTOMER SUCCESS / ONBOARDING / IMPLEMENTATION
+    # TECHNICAL ACCOUNT / CUSTOMER TECHNICAL SUCCESS
+    # --------------------------------------------------------
+    r"\btechnical account support\b",
+    r"\btechnical account specialist\b",
+    r"\btechnical account associate\b",
+    r"\btechnical account manager\b",
+    r"\btechnical account executive\b",
+    r"\btechnical success\b",
+    r"\btechnical success specialist\b",
+    r"\btechnical success manager\b",
+    r"\btechnical customer success\b",
+    r"\bcustomer technical success\b",
+    r"\btechnical client success\b",
+
+    # --------------------------------------------------------
+    # CUSTOMER SUCCESS
     # --------------------------------------------------------
     r"\bcustomer success\b",
     r"\bcustomer success specialist\b",
     r"\bcustomer success associate\b",
     r"\bcustomer success representative\b",
-    r"\bcustomer success agent\b",
     r"\bcustomer success advisor\b",
     r"\bcustomer success consultant\b",
     r"\bcustomer success analyst\b",
     r"\bcustomer success manager\b",
     r"\bcustomer success lead\b",
     r"\bcustomer success director\b",
-    r"\bcustomer success executive\b",
+    r"\bhead of customer success\b",
+    r"\bvp customer success\b",
+    r"\bvice president customer success\b",
     r"\bcustomer success operations\b",
     r"\bcustomer success operations specialist\b",
-    r"\bcustomer success operations analyst\b",
+    r"\bcustomer success operations manager\b",
+    r"\bcustomer success enablement\b",
+    r"\bcustomer success strategy\b",
     r"\bclient success\b",
     r"\bclient success specialist\b",
     r"\bclient success associate\b",
     r"\bclient success representative\b",
     r"\bclient success advisor\b",
     r"\bclient success consultant\b",
+    r"\bclient success analyst\b",
     r"\bclient success manager\b",
     r"\bclient success lead\b",
+    r"\bclient success director\b",
+    r"\bhead of client success\b",
+
+    # --------------------------------------------------------
+    # ONBOARDING
+    # --------------------------------------------------------
     r"\bcustomer onboarding\b",
     r"\bcustomer onboarding specialist\b",
     r"\bcustomer onboarding associate\b",
     r"\bcustomer onboarding representative\b",
     r"\bcustomer onboarding manager\b",
-    r"\bcustomer onboarding consultant\b",
+    r"\bcustomer onboarding lead\b",
     r"\bclient onboarding\b",
     r"\bclient onboarding specialist\b",
     r"\bclient onboarding associate\b",
     r"\bclient onboarding manager\b",
-    r"\bclient onboarding consultant\b",
     r"\bonboarding specialist\b",
     r"\bonboarding associate\b",
     r"\bonboarding representative\b",
@@ -394,41 +492,90 @@ TARGET_TITLE_PATTERNS = [
     r"\bonboarding consultant\b",
     r"\bonboarding manager\b",
     r"\bonboarding lead\b",
+    r"\bonboarding operations\b",
+
+    # --------------------------------------------------------
+    # IMPLEMENTATION
+    # --------------------------------------------------------
+    r"\bcustomer implementation\b",
+    r"\bcustomer implementation specialist\b",
+    r"\bcustomer implementation manager\b",
+    r"\bclient implementation\b",
+    r"\bclient implementation specialist\b",
+    r"\bclient implementation manager\b",
     r"\bimplementation specialist\b",
     r"\bimplementation associate\b",
-    r"\bimplementation representative\b",
     r"\bimplementation consultant\b",
+    r"\bimplementation analyst\b",
     r"\bimplementation manager\b",
     r"\bimplementation lead\b",
-    r"\bimplementation analyst\b",
-    r"\bcustomer implementation\b",
-    r"\bclient implementation\b",
+    r"\bimplementation director\b",
+    r"\bimplementation operations\b",
+    r"\bsolutions implementation\b",
+    r"\bsolution implementation specialist\b",
+
+    # --------------------------------------------------------
+    # ENABLEMENT / EDUCATION / ADOPTION / RETENTION
+    # --------------------------------------------------------
     r"\bcustomer enablement\b",
     r"\bcustomer enablement specialist\b",
     r"\bcustomer enablement manager\b",
+    r"\bclient enablement\b",
+    r"\bclient enablement specialist\b",
     r"\bcustomer education\b",
     r"\bcustomer education specialist\b",
     r"\bcustomer education manager\b",
-    r"\bcustomer advocacy\b",
-    r"\bcustomer advocacy specialist\b",
-    r"\bcustomer advocacy manager\b",
+    r"\bclient education\b",
+    r"\bclient education specialist\b",
     r"\bcustomer adoption\b",
     r"\bcustomer adoption specialist\b",
     r"\bcustomer adoption manager\b",
+    r"\bcustomer retention\b",
     r"\bcustomer retention specialist\b",
     r"\bcustomer retention manager\b",
-    r"\bclient retention specialist\b",
-    r"\bclient retention manager\b",
+    r"\bcustomer lifecycle\b",
     r"\bcustomer lifecycle specialist\b",
     r"\bcustomer lifecycle manager\b",
+    r"\bcustomer engagement\b",
     r"\bcustomer engagement specialist\b",
     r"\bcustomer engagement manager\b",
-    r"\bcustomer experience manager\b",
-    r"\bcustomer experience lead\b",
-    r"\bclient experience manager\b",
-    r"\bclient experience lead\b",
-]
+    r"\bcustomer advocacy\b",
+    r"\bcustomer advocacy specialist\b",
+    r"\bcustomer advocacy manager\b",
 
+    # --------------------------------------------------------
+    # CUSTOMER / CLIENT OPERATIONS & CX SHORT-FORM TITLES
+    # --------------------------------------------------------
+    r"\bcustomer operations\b",
+    r"\bcustomer operations specialist\b",
+    r"\bcustomer operations associate\b",
+    r"\bcustomer operations representative\b",
+    r"\bcustomer operations analyst\b",
+    r"\bcustomer operations manager\b",
+    r"\bclient operations\b",
+    r"\bclient operations specialist\b",
+    r"\bclient operations associate\b",
+    r"\bclient operations analyst\b",
+    r"\bclient operations manager\b",
+    r"\buser operations\b",
+    r"\buser operations specialist\b",
+    r"\buser operations associate\b",
+    r"\buser operations manager\b",
+    r"\bcx specialist\b",
+    r"\bcx associate\b",
+    r"\bcx representative\b",
+    r"\bcx advisor\b",
+    r"\bcx manager\b",
+    r"\bcx lead\b",
+    r"\bcustomer relations specialist\b",
+    r"\bcustomer relations representative\b",
+    r"\bclient relations specialist\b",
+    r"\bclient relations representative\b",
+    r"\btrust and safety specialist\b",
+    r"\btrust & safety specialist\b",
+    r"\btrust and safety operations\b",
+    r"\btrust & safety operations\b",
+]
 
 
 TITLE_REGEX = re.compile(
@@ -438,186 +585,344 @@ TITLE_REGEX = re.compile(
 
 
 # ============================================================
-# ATS METADATA MATCHING
+# JUNK / FALSE-POSITIVE TITLE FILTER
 # ============================================================
 
-RELEVANT_METADATA_PATTERNS = [
-    r"\bcustomer support\b",
-    r"\bcustomer service\b",
-    r"\bcustomer care\b",
-    r"\bcustomer experience\b",
-    r"\bclient support\b",
-    r"\bclient service\b",
-    r"\bmember support\b",
-    r"\bmember services\b",
-    r"\buser support\b",
-    r"\bcommunity support\b",
-    r"\bpartner support\b",
-    r"\bmerchant support\b",
-    r"\bseller support\b",
-    r"\bprovider support\b",
-    r"\bsupport operations\b",
-    r"\btechnical support\b",
-    r"\btechnical services\b",
-    r"\bproduct support\b",
-    r"\bapplication support\b",
-    r"\bsoftware support\b",
-    r"\bplatform support\b",
-    r"\bdeveloper support\b",
-    r"\bapi support\b",
-    r"\bhelp desk\b",
-    r"\bhelpdesk\b",
-    r"\bservice desk\b",
-    r"\bcustomer success\b",
-    r"\bclient success\b",
-    r"\bcustomer onboarding\b",
-    r"\bclient onboarding\b",
-    r"\bonboarding\b",
-    r"\bimplementation\b",
-    r"\bcustomer enablement\b",
-    r"\bcustomer education\b",
-    r"\bcustomer advocacy\b",
-    r"\bcustomer adoption\b",
+EXCLUDED_TITLE_PATTERNS = [
+    r"\bsales support\b",
+    r"\bsales development\b",
+    r"\bsales operations\b",
+    r"\bmarketing support\b",
+    r"\bmarketing operations\b",
+    r"\brecruiting support\b",
+    r"\brecruitment support\b",
+    r"\bexecutive assistant\b",
+    r"\badministrative assistant\b",
+    r"\bpersonal assistant\b",
+    r"\btechnical recruiter\b",
+    r"\bsupporting actor\b",
 ]
 
-
-
-METADATA_REGEX = re.compile(
-    "|".join(RELEVANT_METADATA_PATTERNS),
-    re.IGNORECASE,
-)
-
-
-GENERIC_ROLE_REGEX = re.compile(
-    r"\b("
-    r"specialist|"
-    r"associate|"
-    r"representative|"
-    r"advisor|"
-    r"agent|"
-    r"analyst|"
-    r"coordinator|"
-    r"consultant|"
-    r"executive|"
-    r"engineer|"
-    r"manager"
-    r")\b",
+EXCLUDED_TITLE_REGEX = re.compile(
+    "|".join(EXCLUDED_TITLE_PATTERNS),
     re.IGNORECASE,
 )
 
 
 # ============================================================
-# LOCATION PATTERNS
+# LOCATION DATA
 # ============================================================
 
-INDIA_PATTERNS = [
+INDIA_STATES = [
+    "andhra pradesh",
+    "arunachal pradesh",
+    "assam",
+    "bihar",
+    "chhattisgarh",
+    "goa",
+    "gujarat",
+    "haryana",
+    "himachal pradesh",
+    "jharkhand",
+    "karnataka",
+    "kerala",
+    "madhya pradesh",
+    "maharashtra",
+    "manipur",
+    "meghalaya",
+    "mizoram",
+    "nagaland",
+    "odisha",
+    "orissa",
+    "punjab",
+    "rajasthan",
+    "sikkim",
+    "tamil nadu",
+    "telangana",
+    "tripura",
+    "uttar pradesh",
+    "uttarakhand",
+    "west bengal",
+    "andaman and nicobar",
+    "chandigarh",
+    "dadra and nagar haveli",
+    "daman and diu",
+    "delhi",
+    "jammu and kashmir",
+    "ladakh",
+    "lakshadweep",
+    "puducherry",
+]
+
+INDIA_CITIES = [
+    "ahmedabad",
+    "amritsar",
+    "aurangabad",
+    "bengaluru",
+    "bangalore",
+    "bhilai",
+    "bhubaneswar",
+    "bikaner",
+    "bokaro",
+    "chandigarh",
+    "chennai",
+    "coimbatore",
+    "cochin",
+    "kochi",
+    "cuttack",
+    "dehradun",
+    "delhi",
+    "new delhi",
+    "faridabad",
+    "gandhinagar",
+    "ghaziabad",
+    "goa",
+    "gurgaon",
+    "gurugram",
+    "guwahati",
+    "gwalior",
+    "howrah",
+    "hubli",
+    "hyderabad",
+    "indore",
+    "jaipur",
+    "jalandhar",
+    "jammu",
+    "jamshedpur",
+    "kanpur",
+    "kochi",
+    "kolkata",
+    "kota",
+    "lucknow",
+    "ludhiana",
+    "madurai",
+    "mangalore",
+    "mangaluru",
+    "meerut",
+    "mohali",
+    "mumbai",
+    "bombay",
+    "mysore",
+    "mysuru",
+    "nagpur",
+    "nashik",
+    "navi mumbai",
+    "noida",
+    "patna",
+    "pondicherry",
+    "puducherry",
+    "prayagraj",
+    "allahabad",
+    "pune",
+    "raipur",
+    "rajkot",
+    "ranchi",
+    "salem",
+    "surat",
+    "thane",
+    "thiruvananthapuram",
+    "trivandrum",
+    "udaipur",
+    "vadodara",
+    "baroda",
+    "varanasi",
+    "vijayawada",
+    "visakhapatnam",
+    "vizag",
+    "warangal",
+]
+
+US_STATES = [
+    "alabama",
+    "alaska",
+    "arizona",
+    "arkansas",
+    "california",
+    "colorado",
+    "connecticut",
+    "delaware",
+    "florida",
+    "georgia",
+    "hawaii",
+    "idaho",
+    "illinois",
+    "indiana",
+    "iowa",
+    "kansas",
+    "kentucky",
+    "louisiana",
+    "maine",
+    "maryland",
+    "massachusetts",
+    "michigan",
+    "minnesota",
+    "mississippi",
+    "missouri",
+    "montana",
+    "nebraska",
+    "nevada",
+    "new hampshire",
+    "new jersey",
+    "new mexico",
+    "new york",
+    "north carolina",
+    "north dakota",
+    "ohio",
+    "oklahoma",
+    "oregon",
+    "pennsylvania",
+    "rhode island",
+    "south carolina",
+    "south dakota",
+    "tennessee",
+    "texas",
+    "utah",
+    "vermont",
+    "virginia",
+    "washington",
+    "west virginia",
+    "wisconsin",
+    "wyoming",
+    "district of columbia",
+]
+
+US_CITIES = [
+    "new york",
+    "new york city",
+    "nyc",
+    "los angeles",
+    "san francisco",
+    "san diego",
+    "san jose",
+    "sacramento",
+    "oakland",
+    "seattle",
+    "portland",
+    "las vegas",
+    "phoenix",
+    "tucson",
+    "denver",
+    "austin",
+    "dallas",
+    "fort worth",
+    "houston",
+    "san antonio",
+    "chicago",
+    "boston",
+    "cambridge",
+    "atlanta",
+    "miami",
+    "orlando",
+    "tampa",
+    "charlotte",
+    "raleigh",
+    "durham",
+    "washington dc",
+    "washington d.c.",
+    "washington",
+    "philadelphia",
+    "pittsburgh",
+    "detroit",
+    "minneapolis",
+    "st paul",
+    "st. paul",
+    "nashville",
+    "memphis",
+    "salt lake city",
+    "boise",
+    "columbus",
+    "cleveland",
+    "cincinnati",
+    "indianapolis",
+    "kansas city",
+    "st louis",
+    "st. louis",
+    "omaha",
+    "oklahoma city",
+    "new orleans",
+    "baltimore",
+    "richmond",
+    "norfolk",
+    "virginia beach",
+    "hartford",
+    "providence",
+    "buffalo",
+    "rochester",
+    "albany",
+    "jersey city",
+    "newark",
+    "princeton",
+    "honolulu",
+    "anchorage",
+    "albuquerque",
+    "el paso",
+    "bozeman",
+    "madison",
+    "milwaukee",
+    "boulder",
+    "colorado springs",
+    "spokane",
+    "tacoma",
+    "irvine",
+    "anaheim",
+    "pasadena",
+    "fremont",
+    "berkeley",
+    "santa clara",
+    "mountain view",
+    "palo alto",
+    "redwood city",
+    "menlo park",
+    "cupertino",
+]
+
+INDIA_COUNTRY_PATTERNS = [
     r"\bindia\b",
+    r"\bind\b",
     r"\bindian\b",
-    r"\bbharat\b",
-    # Major cities and common spellings
-    r"\bbengaluru\b", r"\bbangalore\b", r"\bhyderabad\b",
-    r"\bpune\b", r"\bmumbai\b", r"\bbombay\b",
-    r"\bdelhi\b", r"\bnew delhi\b", r"\bnoida\b",
-    r"\bgreater noida\b", r"\bgurgaon\b", r"\bgurugram\b",
-    r"\bfaridabad\b", r"\bghaziabad\b", r"\bchennai\b",
-    r"\bkolkata\b", r"\bcalcutta\b", r"\bahmedabad\b",
-    r"\bsurat\b", r"\bvadodara\b", r"\brajkot\b",
-    r"\bkochi\b", r"\bcochin\b", r"\bthiruvananthapuram\b",
-    r"\btrivandrum\b", r"\bthrissur\b", r"\bkozhikode\b",
-    r"\bcalicut\b", r"\bjaipur\b", r"\budaipur\b",
-    r"\bjodhpur\b", r"\bindore\b", r"\bbhopal\b",
-    r"\bnagpur\b", r"\bnashik\b", r"\baurangabad\b",
-    r"\bchhatrapati sambhajinagar\b", r"\bchandigarh\b",
-    r"\blucknow\b", r"\bkanpur\b", r"\bagra\b",
-    r"\bprayagraj\b", r"\ballahabad\b", r"\bvaranasi\b",
-    r"\bpatna\b", r"\branchi\b", r"\bbhubaneswar\b",
-    r"\bcuttack\b", r"\bguwahati\b", r"\bvisakhapatnam\b",
-    r"\bvijayawada\b", r"\btirupati\b", r"\bcoimbatore\b",
-    r"\bmadurai\b", r"\btrichy\b", r"\btiruchirappalli\b",
-    r"\bsalem\b", r"\bmysore\b", r"\bmysuru\b",
-    r"\bmangalore\b", r"\bmangaluru\b", r"\bhubli\b",
-    r"\bhubballi\b", r"\bamritsar\b", r"\bludhiana\b",
-    r"\bdehradun\b", r"\bsrinagar\b", r"\bjammu\b",
-    # States / territories
-    r"\bandhra pradesh\b", r"\barunachal pradesh\b", r"\bassam\b",
-    r"\bbihar\b", r"\bchhattisgarh\b", r"\bgoa\b",
-    r"\bgujarat\b", r"\bharyana\b", r"\bhimachal pradesh\b",
-    r"\bjharkhand\b", r"\bkarnataka\b", r"\bkerala\b",
-    r"\bmadhya pradesh\b", r"\bmaharashtra\b", r"\bmanipur\b",
-    r"\bmeghalaya\b", r"\bmizoram\b", r"\bnagaland\b",
-    r"\bodisha\b", r"\borissa\b", r"\bpunjab\b",
-    r"\brajasthan\b", r"\bsikkim\b", r"\btamil nadu\b",
-    r"\btelangana\b", r"\btripura\b", r"\buttar pradesh\b",
-    r"\buttarakhand\b", r"\bwest bengal\b",
-    r"\bdelhi nct\b", r"\bpondicherry\b", r"\bpuducherry\b",
 ]
 
-
-
-USA_PATTERNS = [
+USA_COUNTRY_PATTERNS = [
     r"\bunited states\b",
     r"\bunited states of america\b",
     r"\busa\b",
-    r"\bu\.s\.a?\b",
-    r"\bus-based\b",
-    # All 50 states
-    r"\balabama\b", r"\balaska\b", r"\barizona\b", r"\barkansas\b",
-    r"\bcalifornia\b", r"\bcolorado\b", r"\bconnecticut\b", r"\bdelaware\b",
-    r"\bflorida\b", r"\bgeorgia\b", r"\bhawaii\b", r"\bidaho\b",
-    r"\billinois\b", r"\bindiana\b", r"\biowa\b", r"\bkansas\b",
-    r"\bkentucky\b", r"\blouisiana\b", r"\bmaine\b", r"\bmaryland\b",
-    r"\bmassachusetts\b", r"\bmichigan\b", r"\bminnesota\b", r"\bmississippi\b",
-    r"\bmissouri\b", r"\bmontana\b", r"\bnebraska\b", r"\bnevada\b",
-    r"\bnew hampshire\b", r"\bnew jersey\b", r"\bnew mexico\b", r"\bnew york\b",
-    r"\bnorth carolina\b", r"\bnorth dakota\b", r"\bohio\b", r"\boklahoma\b",
-    r"\boregon\b", r"\bpennsylvania\b", r"\brhode island\b", r"\bsouth carolina\b",
-    r"\bsouth dakota\b", r"\btennessee\b", r"\btexas\b", r"\butah\b",
-    r"\bvermont\b", r"\bvirginia\b", r"\bwashington\b", r"\bwest virginia\b",
-    r"\bwisconsin\b", r"\bwyoming\b",
-    # Major cities / metros
-    r"\bnew york city\b", r"\bnyc\b", r"\blos angeles\b", r"\bla\b",
-    r"\bsan francisco\b", r"\bsan diego\b", r"\bsan jose\b",
-    r"\bseattle\b", r"\bportland\b", r"\bchicago\b", r"\bboston\b",
-    r"\baustin\b", r"\bdallas\b", r"\bfort worth\b", r"\bhouston\b",
-    r"\bmiami\b", r"\borlando\b", r"\btampa\b", r"\batlanta\b",
-    r"\bdenver\b", r"\bphoenix\b", r"\bphiladelphia\b", r"\bcharlotte\b",
-    r"\braleigh\b", r"\bdetroit\b", r"\bminneapolis\b", r"\bst louis\b",
-    r"\bkansas city\b", r"\bnashville\b", r"\bnew orleans\b", r"\bcleveland\b",
-    r"\bpittsburgh\b", r"\bcolumbus\b", r"\bcincinnati\b", r"\bindianapolis\b",
-    r"\bmilwaukee\b", r"\bsacramento\b", r"\bsalt lake city\b",
-    r"\bdenver\b", r"\bwashington dc\b", r"\bwashington d\.c\.\b",
-    r"\barlington\b", r"\balexandria\b", r"\bjersey city\b",
-    r"\bnewark\b", r"\bbaltimore\b", r"\bvirginia beach\b",
-    r"\bmemphis\b", r"\boklahoma city\b", r"\blas vegas\b",
+    r"\bu\.s\.a\.\b",
+    r"\bu\.s\.\b",
+    r"\bunited states remote\b",
 ]
-
-
 
 REMOTE_PATTERNS = [
     r"\bremote\b",
     r"\bfully remote\b",
     r"\b100% remote\b",
-    r"\bwork remotely\b",
     r"\bwork from home\b",
     r"\bwork-from-home\b",
     r"\bhome based\b",
     r"\bhome-based\b",
-    r"\bremote first\b",
-    r"\bremote-first\b",
-    r"\bdistributed team\b",
     r"\bdistributed\b",
-    r"\btelecommute\b",
-    r"\btelecommuting\b",
 ]
 
+HYBRID_PATTERNS = [
+    r"\bhybrid\b",
+    r"\bpartially remote\b",
+    r"\bremote hybrid\b",
+]
 
 INDIA_REGEX = re.compile(
-    "|".join(INDIA_PATTERNS),
+    "|".join(
+        [r"\b" + re.escape(x) + r"\b"
+         for x in INDIA_STATES + INDIA_CITIES]
+        + INDIA_COUNTRY_PATTERNS
+    ),
     re.IGNORECASE,
 )
 
 USA_REGEX = re.compile(
-    "|".join(USA_PATTERNS),
+    "|".join(
+        [r"\b" + re.escape(x) + r"\b"
+         for x in US_STATES + US_CITIES]
+        + USA_COUNTRY_PATTERNS
+    ),
     re.IGNORECASE,
 )
 
@@ -626,9 +931,14 @@ REMOTE_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+HYBRID_REGEX = re.compile(
+    "|".join(HYBRID_PATTERNS),
+    re.IGNORECASE,
+)
+
 
 # ============================================================
-# HTTP SESSION
+# HTTP
 # ============================================================
 
 SESSION = requests.Session()
@@ -639,11 +949,60 @@ SESSION.headers.update({
 })
 
 
+def request_json(
+    url,
+    timeout=30,
+    params=None,
+    max_attempts=3,
+):
+    for attempt in range(max_attempts):
+
+        try:
+            response = SESSION.get(
+                url,
+                params=params,
+                timeout=timeout,
+            )
+
+            if response.status_code == 200:
+                return response.json()
+
+            if (
+                response.status_code
+                in SMART_RETRY_STATUS_CODES
+                and attempt < max_attempts - 1
+            ):
+                time.sleep(
+                    min(
+                        4,
+                        1.0 * (attempt + 1),
+                    )
+                )
+                continue
+
+            return None
+
+        except (
+            requests.RequestException,
+            ValueError,
+        ):
+
+            if attempt < max_attempts - 1:
+                time.sleep(
+                    1.0 * (attempt + 1)
+                )
+                continue
+
+            return None
+
+    return None
+
+
 # ============================================================
 # GOOGLE SHEETS
 # ============================================================
 
-def get_google_sheet():
+def get_spreadsheet():
     if not SPREADSHEET_ID:
         raise RuntimeError(
             "Missing SPREADSHEET_ID GitHub secret."
@@ -654,19 +1013,17 @@ def get_google_sheet():
             "Missing GOOGLE_CREDENTIALS GitHub secret."
         )
 
-    credentials_info = json.loads(
+    info = json.loads(
         GOOGLE_CREDENTIALS
     )
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-
     credentials = (
         Credentials.from_service_account_info(
-            credentials_info,
-            scopes=scopes,
+            info,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
         )
     )
 
@@ -674,27 +1031,31 @@ def get_google_sheet():
         credentials
     )
 
-    spreadsheet = client.open_by_key(
+    return client.open_by_key(
         SPREADSHEET_ID
     )
 
+
+def get_or_create_worksheet(
+    spreadsheet,
+    title,
+    rows=1000,
+    cols=12,
+):
     try:
-        worksheet = spreadsheet.worksheet(
-            JOBS_SHEET_NAME
+        return spreadsheet.worksheet(
+            title
         )
-
     except gspread.WorksheetNotFound:
-        worksheet = spreadsheet.add_worksheet(
-            title=JOBS_SHEET_NAME,
-            rows=1000,
-            cols=9,
+        return spreadsheet.add_worksheet(
+            title=title,
+            rows=rows,
+            cols=cols,
         )
-
-    return worksheet
 
 
 # ============================================================
-# GENERAL HELPERS
+# HELPERS
 # ============================================================
 
 def clean_text(value):
@@ -722,96 +1083,19 @@ def normalize_url(url):
     if not url:
         return ""
 
-    url = str(url).strip()
-
     try:
-        parsed = urlparse(url)
+        parsed = urlparse(
+            str(url).strip()
+        )
 
-        if not parsed.scheme or not parsed.netloc:
-            return url.rstrip("/")
-
-        clean = (
+        return (
             f"{parsed.scheme.lower()}://"
             f"{parsed.netloc.lower()}"
-            f"{parsed.path.rstrip('/')}"
-        )
-
-        return clean
+            f"{parsed.path}"
+        ).rstrip("/")
 
     except Exception:
-        return url.rstrip("/")
-
-
-def normalize_for_duplicate(value):
-    value = clean_text(value).lower()
-
-    value = re.sub(
-        r"[^a-z0-9]+",
-        " ",
-        value,
-    )
-
-    return re.sub(
-        r"\s+",
-        " ",
-        value,
-    ).strip()
-
-
-def make_job_key(
-    ats,
-    job_id,
-    url,
-):
-    if job_id:
-        raw = (
-            f"{ats.lower()}:"
-            f"{str(job_id).strip()}"
-        )
-
-    else:
-        raw = (
-            f"url:"
-            f"{normalize_url(url).lower()}"
-        )
-
-    return hashlib.sha256(
-        raw.encode("utf-8")
-    ).hexdigest()
-
-
-def make_fallback_job_key(
-    job,
-):
-    """
-    Secondary duplicate protection.
-
-    This catches the same posting if the ATS returns it
-    without a stable job ID but with the same company,
-    title and location.
-    """
-
-    company = normalize_for_duplicate(
-        job.get("company")
-    )
-
-    title = normalize_for_duplicate(
-        job.get("title")
-    )
-
-    location = normalize_for_duplicate(
-        job.get("location")
-    )
-
-    raw = (
-        f"{company}|"
-        f"{title}|"
-        f"{location}"
-    )
-
-    return hashlib.sha256(
-        raw.encode("utf-8")
-    ).hexdigest()
+        return str(url).strip().rstrip("/")
 
 
 def parse_date(value):
@@ -821,14 +1105,12 @@ def parse_date(value):
     value = str(value).strip()
 
     try:
-        dt = datetime.fromisoformat(
+        return datetime.fromisoformat(
             value.replace(
                 "Z",
                 "+00:00",
             )
-        )
-
-        return dt.date().isoformat()
+        ).date().isoformat()
 
     except Exception:
         pass
@@ -846,12 +1128,10 @@ def parse_date(value):
         number = int(value)
 
         if number > 100000000000:
-            dt = datetime.fromtimestamp(
+            return datetime.fromtimestamp(
                 number / 1000,
                 tz=timezone.utc,
-            )
-
-            return dt.date().isoformat()
+            ).date().isoformat()
 
     except Exception:
         pass
@@ -859,231 +1139,226 @@ def parse_date(value):
     return ""
 
 
-def request_json(
+def make_job_key(
+    ats,
+    job_id,
     url,
-    timeout=30,
-    params=None,
 ):
-    """
-    GET JSON with limited retries for temporary
-    rate limits and server errors.
-    """
+    if job_id:
+        raw = (
+            f"{ats.lower()}:"
+            f"{str(job_id).strip().lower()}"
+        )
+    else:
+        raw = (
+            f"{ats.lower()}:"
+            f"{normalize_url(url)}"
+        )
 
-    for attempt in range(3):
-
-        try:
-            response = SESSION.get(
-                url,
-                params=params,
-                timeout=timeout,
-            )
-
-            if response.status_code == 200:
-                return response.json()
-
-            if response.status_code in (
-                429,
-                500,
-                502,
-                503,
-                504,
-            ):
-
-                if attempt < 2:
-                    time.sleep(
-                        1.5 * (attempt + 1)
-                    )
-                    continue
-
-            return None
-
-        except Exception:
-
-            if attempt < 2:
-                time.sleep(
-                    1.5 * (attempt + 1)
-                )
-                continue
-
-            return None
-
-    return None
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()
 
 
-# ============================================================
-# JOB MATCHING
-# ============================================================
-
-def is_target_title(title):
+def title_is_relevant(
+    title,
+):
     title = clean_text(title)
 
     if not title:
         return False
 
-    return bool(
-        TITLE_REGEX.search(title)
-    )
-
-
-def has_relevant_metadata(
-    metadata,
-):
-    metadata = clean_text(
-        metadata
-    )
-
-    if not metadata:
+    if EXCLUDED_TITLE_REGEX.search(
+        title
+    ):
         return False
 
     return bool(
-        METADATA_REGEX.search(
-            metadata
+        TITLE_REGEX.search(
+            title
         )
     )
 
 
-def is_relevant_job(
-    title,
-    metadata="",
+def has_remote_word(
+    text,
 ):
-    """
-    Title is the primary signal.
-
-    Metadata can rescue a generic role title only when
-    the ATS department/team/function explicitly identifies
-    it as Support/Success/Onboarding/Implementation/etc.
-    """
-
-    title = clean_text(title)
-
-    if is_target_title(title):
-        return True
-
-    if (
-        GENERIC_ROLE_REGEX.search(title)
-        and has_relevant_metadata(
-            metadata
+    return bool(
+        REMOTE_REGEX.search(
+            clean_text(text)
         )
-    ):
-        return True
-
-    return False
+    )
 
 
-# ============================================================
-# REMOTE + COUNTRY CLASSIFICATION
-# ============================================================
+def has_hybrid_word(
+    text,
+):
+    return bool(
+        HYBRID_REGEX.search(
+            clean_text(text)
+        )
+    )
+
 
 def classify_country(
-    location,
+    location="",
     country_code="",
+    address_country="",
+    description="",
 ):
-    location = clean_text(
-        location
-    )
+    """
+    Country classification is deliberately conservative.
+
+    Priority:
+      1. Explicit country code
+      2. Explicit address country
+      3. Location/city/state
+      4. Description only when needed
+    """
 
     code = clean_text(
         country_code
     ).upper()
 
-    # Explicit country codes first.
-    if code in (
-        "IN",
-        "IND",
-        "INDIA",
-    ):
-        return "India"
+    addr = clean_text(
+        address_country
+    ).lower()
 
-    if code in (
-        "US",
-        "USA",
-        "UNITED STATES",
-    ):
-        return "USA"
-
-    if INDIA_REGEX.search(
-        location
-    ):
-        return "India"
-
-    if USA_REGEX.search(
-        location
-    ):
-        return "USA"
-
-    return ""
-
-
-def is_remote_job(
-    location,
-    remote=False,
-    workplace_type="",
-):
     location = clean_text(
         location
     )
 
-    workplace_type = clean_text(
-        workplace_type
-    ).lower()
+    description = clean_text(
+        description
+    )
 
-    if remote is True:
-        return True
+    if code in {
+        "IN",
+        "IND",
+        "INDIA",
+    }:
+        return "India"
 
-    if workplace_type in (
-        "remote",
-        "fully remote",
-        "work from home",
-    ):
-        return True
+    if code in {
+        "US",
+        "USA",
+        "UNITED STATES",
+    }:
+        return "USA"
 
-    if REMOTE_REGEX.search(
-        location
-    ):
-        return True
+    if addr in {
+        "in",
+        "ind",
+        "india",
+    }:
+        return "India"
 
-    return False
+    if addr in {
+        "us",
+        "usa",
+        "united states",
+        "united states of america",
+    }:
+        return "USA"
+
+    if INDIA_REGEX.search(location):
+        return "India"
+
+    if USA_REGEX.search(location):
+        return "USA"
+
+    # Only use description for ambiguous remote/hybrid jobs.
+    # This helps ATS entries such as "Remote" where the actual
+    # country eligibility is mentioned in the text.
+    if description:
+
+        first_part = (
+            description[:12000]
+        )
+
+        if INDIA_REGEX.search(
+            first_part
+        ):
+            return "India"
+
+        if USA_REGEX.search(
+            first_part
+        ):
+            return "USA"
+
+    return ""
 
 
-def classify_job_location(
-    location,
-    remote=False,
-    country_code="",
+def classify_workplace(
+    location="",
     workplace_type="",
+    remote_flag=False,
+    description="",
 ):
     """
     Returns:
-        (country, is_remote)
-
-    Only India/USA + remote are accepted.
+      remote
+      hybrid
+      onsite
+      unknown
     """
 
-    remote_ok = is_remote_job(
-        location,
-        remote,
-        workplace_type,
-    )
+    workplace = clean_text(
+        workplace_type
+    ).lower()
 
-    if not remote_ok:
-        return "", False
+    if workplace in {
+        "remote",
+        "fully remote",
+    }:
+        return "remote"
 
-    country = classify_country(
-        location,
-        country_code,
-    )
+    if workplace in {
+        "hybrid",
+    }:
+        return "hybrid"
 
-    if country not in (
-        "India",
-        "USA",
-    ):
-        return "", False
+    if remote_flag:
+        return "remote"
 
-    return country, True
+    if has_remote_word(location):
+        return "remote"
+
+    if has_hybrid_word(location):
+        return "hybrid"
+
+    if description:
+
+        # Prefer an explicit workplace phrase near the start
+        # of the description, while avoiding broad text matches.
+        head = description[:5000]
+
+        if has_hybrid_word(head):
+            return "hybrid"
+
+        if has_remote_word(head):
+            return "remote"
+
+    return "unknown"
 
 
-# ============================================================
-# DATE FILTER
-# ============================================================
+def location_is_allowed(
+    country,
+    workplace,
+):
+    # USA: remote only.
+    if country == "USA":
+        return workplace == "remote"
+
+    # India: remote OR hybrid.
+    if country == "India":
+        return workplace in {
+            "remote",
+            "hybrid",
+        }
+
+    return False
+
 
 def is_recent(
     posted_date,
@@ -1092,7 +1367,7 @@ def is_recent(
         return True
 
     try:
-        dt = datetime.strptime(
+        posted = datetime.strptime(
             posted_date,
             "%Y-%m-%d",
         ).date()
@@ -1106,14 +1381,14 @@ def is_recent(
             )
         )
 
-        return dt >= cutoff
+        return posted >= cutoff
 
     except Exception:
         return True
 
 
 # ============================================================
-# WAYBACK BOARD DISCOVERY
+# BOARD DISCOVERY
 # ============================================================
 
 def extract_slug_from_url(
@@ -1131,9 +1406,7 @@ def extract_slug_from_url(
             .split(":")[0]
         )
 
-        if hostname != (
-            domain.lower()
-        ):
+        if hostname != domain.lower():
             return None
 
         path = parsed.path.strip(
@@ -1166,15 +1439,17 @@ def extract_slug_from_url(
             "api",
             "locations",
             "departments",
+            "companies",
+            "account",
         }
 
         if slug.lower() in blocked:
             return None
 
-        if (
-            len(slug) < 2
-            or len(slug) > 150
-        ):
+        if len(slug) < 2:
+            return None
+
+        if len(slug) > 150:
             return None
 
         return slug
@@ -1186,11 +1461,6 @@ def extract_slug_from_url(
 def discover_from_wayback(
     domain,
 ):
-    """
-    Discover candidate company/board slugs from
-    Internet Archive CDX.
-    """
-
     candidates = set()
 
     url = (
@@ -1215,7 +1485,6 @@ def discover_from_wayback(
                 f"{response.status_code} "
                 f"for {domain}"
             )
-
             return candidates
 
         data = response.json()
@@ -1226,16 +1495,11 @@ def discover_from_wayback(
                 item,
                 list,
             ):
-
                 if not item:
                     continue
-
                 original = item[0]
-
             else:
-                original = str(
-                    item
-                )
+                original = str(item)
 
             slug = extract_slug_from_url(
                 original,
@@ -1256,98 +1520,203 @@ def discover_from_wayback(
     return candidates
 
 
+def discover_from_commoncrawl(domain):
+    """Fallback board discovery when Wayback is unavailable."""
+    candidates = set()
+
+    try:
+        info = SESSION.get(
+            "https://index.commoncrawl.org/collinfo.json",
+            timeout=30,
+        )
+
+        if info.status_code != 200:
+            return candidates
+
+        collections = info.json()
+
+        if not collections:
+            return candidates
+
+        index_url = collections[0].get("cdx-api")
+
+        if not index_url:
+            return candidates
+
+        query = (
+            f"{index_url}?url={quote(domain + '/*', safe=':/?*')}"
+            "&output=json&filter=status:200&collapse=urlkey"
+            "&limit=100000"
+        )
+
+        response = SESSION.get(
+            query,
+            timeout=90,
+        )
+
+        if response.status_code != 200:
+            print(
+                f"Common Crawl returned {response.status_code} "
+                f"for {domain}"
+            )
+            return candidates
+
+        for line in response.text.splitlines():
+            if not line.strip():
+                continue
+
+            try:
+                item = json.loads(line)
+                original = item.get("url", "")
+            except Exception:
+                continue
+
+            slug = extract_slug_from_url(
+                original,
+                domain,
+            )
+
+            if slug:
+                candidates.add(slug)
+
+    except Exception as exc:
+        print(
+            f"Common Crawl discovery failed for {domain}: {exc}"
+        )
+
+    return candidates
+
+
 def discover_boards_for_ats(
     ats,
 ):
-    source = ATS_SOURCES[
-        ats
-    ]
-
-    all_candidates = set()
+    candidates = set()
 
     print(
         f"\nDiscovering {ats} boards..."
     )
 
-    for domain in source[
-        "archive_domains"
-    ]:
+    for domain in ATS_SOURCES[
+        ats
+    ].get(
+        "archive_domains",
+        [],
+    ):
 
-        candidates = (
-            discover_from_wayback(
+        found = discover_from_wayback(
+            domain
+        )
+
+        # Internet Archive can occasionally return 5xx/503 for
+        # high-volume ATS domains. Use Common Crawl as a fallback
+        # instead of silently losing that ATS from the crawler.
+        if not found:
+            fallback = discover_from_commoncrawl(
                 domain
             )
-        )
+            if fallback:
+                print(
+                    f"  Common Crawl fallback: "
+                    f"{len(fallback)} candidates"
+                )
+            found.update(fallback)
 
         print(
             f"  {domain}: "
-            f"{len(candidates)} candidates"
+            f"{len(found)} candidates"
         )
 
-        all_candidates.update(
-            candidates
+        candidates.update(
+            found
         )
 
     print(
         f"  Total {ats} candidates: "
-        f"{len(all_candidates)}"
+        f"{len(candidates)}"
     )
 
-    return all_candidates
+    return candidates
 
 
 # ============================================================
 # BOARD VALIDATION
 # ============================================================
 
-def validate_generic_board(
-    ats,
+def validate_greenhouse(
     slug,
 ):
-    source = ATS_SOURCES[
-        ats
-    ]
-
-    url = source[
-        "api"
-    ].format(
+    url = ATS_SOURCES[
+        "greenhouse"
+    ]["api"].format(
         slug=slug
     )
 
-    try:
-        response = SESSION.head(
-            url,
-            timeout=15,
-            allow_redirects=True,
+    data = request_json(
+        url,
+        timeout=20,
+    )
+
+    return isinstance(
+        data,
+        dict,
+    ) and isinstance(
+        data.get("jobs"),
+        list,
+    )
+
+
+def validate_ashby(
+    slug,
+):
+    url = ATS_SOURCES[
+        "ashby"
+    ]["api"].format(
+        slug=slug
+    )
+
+    data = request_json(
+        url,
+        timeout=20,
+    )
+
+    return isinstance(
+        data,
+        dict,
+    ) and isinstance(
+        data.get("jobs"),
+        list,
+    )
+
+
+def validate_lever(
+    slug,
+    eu=False,
+):
+    if eu:
+        url = ATS_SOURCES[
+            "lever"
+        ]["eu_api"].format(
+            slug=slug
+        )
+    else:
+        url = ATS_SOURCES[
+            "lever"
+        ]["api"].format(
+            slug=slug
         )
 
-        if response.status_code == 200:
-            return True
+    data = request_json(
+        url,
+        timeout=20,
+    )
 
-        if response.status_code in (
-            403,
-            405,
-            429,
-        ):
-
-            response = SESSION.get(
-                url,
-                timeout=20,
-                stream=True,
-            )
-
-            return (
-                response.status_code
-                == 200
-            )
-
-    except Exception:
-        pass
-
-    return False
+    return isinstance(
+        data,
+        list,
+    )
 
 
-def validate_workable_board(
+def validate_workable(
     slug,
 ):
     url = ATS_SOURCES[
@@ -1364,15 +1733,12 @@ def validate_workable_board(
         },
     )
 
-    if not isinstance(
-        data,
-        dict,
-    ):
-        return False
-
-    return isinstance(
-        data.get("jobs"),
-        list,
+    return (
+        isinstance(data, dict)
+        and isinstance(
+            data.get("jobs"),
+            list,
+        )
     )
 
 
@@ -1380,15 +1746,34 @@ def validate_board(
     ats,
     slug,
 ):
-    if ats == "workable":
-        return validate_workable_board(
+    if ats == "greenhouse":
+        return validate_greenhouse(
             slug
         )
 
-    return validate_generic_board(
-        ats,
-        slug,
-    )
+    if ats == "ashby":
+        return validate_ashby(
+            slug
+        )
+
+    if ats == "lever":
+        return (
+            validate_lever(
+                slug,
+                eu=False,
+            )
+            or validate_lever(
+                slug,
+                eu=True,
+            )
+        )
+
+    if ats == "workable":
+        return validate_workable(
+            slug
+        )
+
+    return False
 
 
 def validate_boards(
@@ -1431,12 +1816,10 @@ def validate_boards(
             ]
 
             try:
-
                 if future.result():
                     valid.append(
                         slug
                     )
-
             except Exception:
                 pass
 
@@ -1449,20 +1832,323 @@ def validate_boards(
                     f"{len(candidates)}"
                 )
 
+    valid = sorted(
+        set(valid),
+        key=str.lower,
+    )
+
     print(
         f"  LIVE {ats} boards: "
         f"{len(valid)}"
     )
 
-    return sorted(
-        set(valid),
-        key=str.lower,
+    return valid
+
+
+# ============================================================
+# PERSISTENT BOARD CACHE
+# ============================================================
+
+BOARD_HEADERS = [
+    "ATS",
+    "Board Slug",
+    "Last Validated",
+    "Failures",
+    "Active",
+]
+
+
+def load_board_cache(
+    worksheet,
+):
+    cache = {}
+
+    try:
+        rows = worksheet.get_all_values()
+
+        if not rows:
+            return cache
+
+        headers = rows[0]
+
+        indexes = {
+            name: (
+                headers.index(name)
+                if name in headers
+                else -1
+            )
+            for name in BOARD_HEADERS
+        }
+
+        for row in rows[1:]:
+
+            ats_i = indexes["ATS"]
+            slug_i = indexes[
+                "Board Slug"
+            ]
+
+            if (
+                ats_i < 0
+                or slug_i < 0
+                or len(row) <= max(
+                    ats_i,
+                    slug_i,
+                )
+            ):
+                continue
+
+            ats = clean_text(
+                row[ats_i]
+            ).lower()
+
+            slug = clean_text(
+                row[slug_i]
+            )
+
+            if not ats or not slug:
+                continue
+
+            active_i = indexes[
+                "Active"
+            ]
+
+            active = (
+                row[active_i].lower()
+                == "yes"
+                if active_i >= 0
+                and len(row) > active_i
+                else True
+            )
+
+            if not active:
+                continue
+
+            validated_i = indexes[
+                "Last Validated"
+            ]
+
+            validated = (
+                row[validated_i]
+                if validated_i >= 0
+                and len(row) > validated_i
+                else ""
+            )
+
+            failures_i = indexes[
+                "Failures"
+            ]
+
+            try:
+                failures = int(
+                    row[failures_i]
+                ) if (
+                    failures_i >= 0
+                    and len(row) > failures_i
+                    and row[failures_i]
+                ) else 0
+            except Exception:
+                failures = 0
+
+            cache[
+                (ats, slug)
+            ] = {
+                "ats": ats,
+                "slug": slug,
+                "last_validated": validated,
+                "failures": failures,
+                "active": True,
+            }
+
+    except Exception as exc:
+        print(
+            f"Could not load board cache: "
+            f"{exc}"
+        )
+
+    return cache
+
+
+def board_cache_is_fresh(
+    cache,
+):
+    if not cache:
+        return False
+
+    cutoff = (
+        datetime.now(
+            timezone.utc
+        )
+        - timedelta(
+            days=BOARD_CACHE_DAYS
+        )
     )
 
+    dates = []
+
+    for item in cache.values():
+
+        value = item.get(
+            "last_validated",
+            "",
+        )
+
+        try:
+            dates.append(
+                datetime.fromisoformat(
+                    value.replace(
+                        "Z",
+                        "+00:00",
+                    )
+                )
+            )
+        except Exception:
+            return False
+
+    if not dates:
+        return False
+
+    return min(dates) >= cutoff
+
+
+def save_board_cache(
+    worksheet,
+    boards,
+):
+    rows = [
+        BOARD_HEADERS
+    ]
+
+    today = (
+        datetime.now(
+            timezone.utc
+        ).date().isoformat()
+    )
+
+    for ats in sorted(
+        boards
+    ):
+
+        for slug in sorted(
+            boards[ats],
+            key=str.lower,
+        ):
+            rows.append([
+                ats,
+                slug,
+                today,
+                0,
+                "Yes",
+            ])
+
+    try:
+        worksheet.clear()
+
+        worksheet.update(
+            "A1",
+            rows,
+            value_input_option="RAW",
+        )
+
+        print(
+            f"Saved {len(rows) - 1} "
+            f"live boards to Boards sheet."
+        )
+
+    except Exception as exc:
+        print(
+            f"Could not save board cache: "
+            f"{exc}"
+        )
+
+
+def discover_or_load_boards(
+    spreadsheet,
+):
+    boards_sheet = get_or_create_worksheet(
+        spreadsheet,
+        "Boards",
+        rows=5000,
+        cols=5,
+    )
+
+    cache = load_board_cache(
+        boards_sheet
+    )
+
+    if board_cache_is_fresh(
+        cache
+    ):
+        boards = {}
+
+        for item in cache.values():
+            boards.setdefault(
+                item["ats"],
+                [],
+            ).append(
+                item["slug"]
+            )
+
+        print(
+            "\nUsing cached live boards."
+        )
+
+        for ats in ATS_SOURCES:
+            print(
+                f"  {ats}: "
+                f"{len(boards.get(ats, []))}"
+            )
+
+        return boards
+
+    print(
+        "\nBoard cache is empty or "
+        "older than "
+        f"{BOARD_CACHE_DAYS} days."
+    )
+
+    boards = {}
+
+    for ats in ATS_SOURCES:
+
+        candidates = (
+            discover_boards_for_ats(
+                ats
+            )
+        )
+
+        boards[ats] = (
+            validate_boards(
+                ats,
+                candidates,
+            )
+        )
+
+    save_board_cache(
+        boards_sheet,
+        boards,
+    )
+
+    return boards
+
 
 # ============================================================
-# GREENHOUSE
+# JOB FETCHERS
 # ============================================================
+
+def fetch_greenhouse_detail(slug, job_id):
+    """Fetch one Greenhouse job only when the list result is ambiguous."""
+    if not job_id:
+        return None
+
+    base = ATS_SOURCES["greenhouse"]["api"].format(
+        slug=slug
+    )
+
+    return request_json(
+        f"{base}/{job_id}",
+        timeout=20,
+    )
+
 
 def fetch_greenhouse(
     slug,
@@ -1484,49 +2170,101 @@ def fetch_greenhouse(
     ):
         return []
 
-    jobs = data.get(
-        "jobs",
-        [],
-    )
-
     results = []
 
-    for job in jobs:
+    for job in data.get(
+        "jobs",
+        [],
+    ):
 
         title = clean_text(
             job.get("title")
         )
 
-        if not is_relevant_job(
+        if not title_is_relevant(
             title
         ):
             continue
 
-        location_obj = (
-            job.get("location")
-            or {}
-        )
-
         location = clean_text(
-            location_obj.get(
-                "name"
-            )
+            (
+                job.get("location")
+                or {}
+            ).get("name")
         )
 
-        remote = bool(
-            REMOTE_REGEX.search(
-                location
-            )
+        job_id = str(
+            job.get("id")
+            or ""
         )
 
-        country, remote_ok = (
-            classify_job_location(
-                location,
-                remote=remote,
-            )
+        workplace = classify_workplace(
+            location=location,
         )
 
-        if not remote_ok:
+        country = classify_country(
+            location=location,
+        )
+
+        # Only relevant-but-ambiguous Greenhouse postings get a
+        # second request. This recovers country/workplace data from
+        # the full posting without downloading every description.
+        if not location_is_allowed(
+            country,
+            workplace,
+        ) and job_id:
+            detail = fetch_greenhouse_detail(
+                slug,
+                job_id,
+            )
+
+            if isinstance(detail, dict):
+                detail_location = clean_text(
+                    (
+                        detail.get("location")
+                        or {}
+                    ).get("name")
+                )
+
+                if detail_location:
+                    location = detail_location
+
+                office_text = " ".join(
+                    (
+                        clean_text(office.get("name"))
+                        + " "
+                        + clean_text(office.get("location"))
+                    )
+                    for office in (detail.get("offices") or [])
+                    if isinstance(office, dict)
+                )
+
+                department_text = " ".join(
+                    clean_text(dept.get("name"))
+                    for dept in (detail.get("departments") or [])
+                    if isinstance(dept, dict)
+                )
+
+                detail_text = " ".join([
+                    clean_text(detail.get("content")),
+                    office_text,
+                    department_text,
+                ])
+
+                workplace = classify_workplace(
+                    location=location,
+                    description=detail_text,
+                )
+
+                country = classify_country(
+                    location=location,
+                    description=detail_text,
+                )
+
+        if not location_is_allowed(
+            country,
+            workplace,
+        ):
             continue
 
         posted = parse_date(
@@ -1543,16 +2281,10 @@ def fetch_greenhouse(
         ):
             continue
 
-        job_id = str(
-            job.get("id")
-            or ""
-        )
-
-        link = (
+        link = clean_text(
             job.get(
                 "absolute_url"
             )
-            or ""
         )
 
         if not link:
@@ -1565,16 +2297,13 @@ def fetch_greenhouse(
             "title": title,
             "location": location,
             "country": country,
+            "workplace": workplace,
             "posted_date": posted,
             "job_url": link,
         })
 
     return results
 
-
-# ============================================================
-# ASHBY
-# ============================================================
 
 def fetch_ashby(
     slug,
@@ -1596,14 +2325,12 @@ def fetch_ashby(
     ):
         return []
 
-    jobs = data.get(
-        "jobs",
-        [],
-    )
-
     results = []
 
-    for job in jobs:
+    for job in data.get(
+        "jobs",
+        [],
+    ):
 
         if job.get(
             "isListed",
@@ -1615,34 +2342,60 @@ def fetch_ashby(
             job.get("title")
         )
 
-        metadata = " ".join([
-            clean_text(
-                job.get(
-                    "department"
-                )
-            ),
-            clean_text(
-                job.get("team")
-            ),
-        ])
-
-        if not is_relevant_job(
-            title,
-            metadata,
+        if not title_is_relevant(
+            title
         ):
             continue
 
         locations = []
 
-        primary = job.get(
-            "location"
+        primary = clean_text(
+            job.get("location")
         )
 
         if primary:
             locations.append(
-                clean_text(
-                    primary
-                )
+                primary
+            )
+
+        address = (
+            job.get("address")
+            or {}
+        ).get(
+            "postalAddress"
+        ) or {}
+
+        address_country = clean_text(
+            address.get(
+                "addressCountry"
+            )
+        )
+
+        address_city = clean_text(
+            address.get(
+                "addressLocality"
+            )
+        )
+
+        address_region = clean_text(
+            address.get(
+                "addressRegion"
+            )
+        )
+
+        if address_city:
+            locations.append(
+                address_city
+            )
+
+        if address_region:
+            locations.append(
+                address_region
+            )
+
+        if address_country:
+            locations.append(
+                address_country
             )
 
         for secondary in (
@@ -1656,46 +2409,72 @@ def fetch_ashby(
                 secondary,
                 dict,
             ):
-
-                loc = secondary.get(
-                    "location"
+                loc = clean_text(
+                    secondary.get(
+                        "location"
+                    )
                 )
 
                 if loc:
                     locations.append(
-                        clean_text(
-                            loc
-                        )
+                        loc
+                    )
+
+                sec_address = (
+                    secondary.get(
+                        "address"
+                    )
+                    or {}
+                )
+
+                sec_country = clean_text(
+                    sec_address.get(
+                        "addressCountry"
+                    )
+                )
+
+                if sec_country:
+                    locations.append(
+                        sec_country
                     )
 
         location = ", ".join(
             dict.fromkeys(
-                locations
+                x for x in locations
+                if x
             )
         )
 
-        remote = bool(
+        description = clean_text(
             job.get(
-                "isRemote",
-                False,
+                "descriptionPlain"
             )
         )
 
-        workplace_type = clean_text(
-            job.get(
+        workplace = classify_workplace(
+            location=location,
+            workplace_type=job.get(
                 "workplaceType"
-            )
+            ),
+            remote_flag=bool(
+                job.get(
+                    "isRemote",
+                    False,
+                )
+            ),
+            description=description,
         )
 
-        country, remote_ok = (
-            classify_job_location(
-                location,
-                remote=remote,
-                workplace_type=workplace_type,
-            )
+        country = classify_country(
+            location=location,
+            address_country=address_country,
+            description=description,
         )
 
-        if not remote_ok:
+        if not location_is_allowed(
+            country,
+            workplace,
+        ):
             continue
 
         posted = parse_date(
@@ -1709,20 +2488,19 @@ def fetch_ashby(
         ):
             continue
 
+        link = clean_text(
+            job.get("jobUrl")
+            or job.get("applyUrl")
+        )
+
+        if not link:
+            continue
+
         job_id = str(
             job.get("id")
             or job.get("jobId")
             or ""
         )
-
-        link = (
-            job.get("jobUrl")
-            or job.get("applyUrl")
-            or ""
-        )
-
-        if not link:
-            continue
 
         results.append({
             "ats": "ashby",
@@ -1731,6 +2509,7 @@ def fetch_ashby(
             "title": title,
             "location": location,
             "country": country,
+            "workplace": workplace,
             "posted_date": posted,
             "job_url": link,
         })
@@ -1738,18 +2517,22 @@ def fetch_ashby(
     return results
 
 
-# ============================================================
-# LEVER
-# ============================================================
-
 def fetch_lever(
     slug,
+    eu=False,
 ):
-    url = ATS_SOURCES[
-        "lever"
-    ]["api"].format(
-        slug=slug
-    )
+    if eu:
+        url = ATS_SOURCES[
+            "lever"
+        ]["eu_api"].format(
+            slug=slug
+        )
+    else:
+        url = ATS_SOURCES[
+            "lever"
+        ]["api"].format(
+            slug=slug
+        )
 
     data = request_json(
         url,
@@ -1770,35 +2553,28 @@ def fetch_lever(
             job.get("text")
         )
 
-        categories = (
-            job.get(
-                "categories"
-            )
-            or {}
-        )
-
-        metadata = " ".join([
-            clean_text(
-                categories.get(
-                    "team"
-                )
-            ),
-            clean_text(
-                categories.get(
-                    "department"
-                )
-            ),
-        ])
-
-        if not is_relevant_job(
-            title,
-            metadata,
+        if not title_is_relevant(
+            title
         ):
             continue
+
+        categories = (
+            job.get("categories")
+            or {}
+        )
 
         location = clean_text(
             categories.get(
                 "location"
+            )
+        )
+
+        description = clean_text(
+            job.get(
+                "descriptionPlain"
+            )
+            or job.get(
+                "description"
             )
         )
 
@@ -1808,35 +2584,24 @@ def fetch_lever(
             )
         )
 
-        workplace = clean_text(
-            job.get(
+        workplace = classify_workplace(
+            location=location,
+            workplace_type=job.get(
                 "workplaceType"
-            )
+            ),
+            description=description,
         )
 
-        remote = (
-            workplace.lower()
-            in (
-                "remote",
-                "fully remote",
-            )
-            or bool(
-                REMOTE_REGEX.search(
-                    location
-                )
-            )
+        country = classify_country(
+            location=location,
+            country_code=country_code,
+            description=description,
         )
 
-        country, remote_ok = (
-            classify_job_location(
-                location,
-                remote=remote,
-                country_code=country_code,
-                workplace_type=workplace,
-            )
-        )
-
-        if not remote_ok:
+        if not location_is_allowed(
+            country,
+            workplace,
+        ):
             continue
 
         posted = parse_date(
@@ -1850,29 +2615,24 @@ def fetch_lever(
         ):
             continue
 
-        job_id = str(
-            job.get("id")
-            or ""
-        )
-
         urls = (
             job.get("urls")
             or {}
         )
 
-        link = (
+        link = clean_text(
             urls.get("show")
-            or job.get(
-                "hostedUrl"
-            )
-            or job.get(
-                "applyUrl"
-            )
-            or ""
+            or job.get("hostedUrl")
+            or job.get("applyUrl")
         )
 
         if not link:
             continue
+
+        job_id = str(
+            job.get("id")
+            or ""
+        )
 
         results.append({
             "ats": "lever",
@@ -1881,16 +2641,13 @@ def fetch_lever(
             "title": title,
             "location": location,
             "country": country,
+            "workplace": workplace,
             "posted_date": posted,
             "job_url": link,
         })
 
     return results
 
-
-# ============================================================
-# WORKABLE
-# ============================================================
 
 def fetch_workable(
     slug,
@@ -1915,99 +2672,65 @@ def fetch_workable(
     ):
         return []
 
-    jobs = data.get(
-        "jobs",
-        [],
-    )
-
     results = []
 
-    for job in jobs:
+    for job in data.get(
+        "jobs",
+        [],
+    ):
 
         title = clean_text(
             job.get("title")
         )
 
-        metadata = " ".join([
-            clean_text(
-                job.get(
-                    "department"
-                )
-            ),
-            clean_text(
-                job.get(
-                    "function"
-                )
-            ),
-        ])
-
-        if not is_relevant_job(
-            title,
-            metadata,
+        if not title_is_relevant(
+            title
         ):
             continue
 
         country_code = clean_text(
-            job.get(
-                "country"
-            )
-        )
-
-        state = clean_text(
-            job.get(
-                "state"
-            )
+            job.get("country")
         )
 
         city = clean_text(
-            job.get(
-                "city"
-            )
+            job.get("city")
         )
 
-        location_parts = [
-            city,
-            state,
-            country_code,
-        ]
+        state = clean_text(
+            job.get("state")
+        )
 
         location = ", ".join(
-            dict.fromkeys(
-                x
-                for x in location_parts
-                if x
-            )
+            x for x in [
+                city,
+                state,
+                country_code,
+            ]
+            if x
         )
 
-        workplace_type = clean_text(
-            job.get(
+        workplace = classify_workplace(
+            location=location,
+            workplace_type=job.get(
                 "workplace_type"
-            )
+            ),
+            remote_flag=bool(
+                job.get(
+                    "telecommuting",
+                    False,
+                )
+            ),
         )
 
-        remote = bool(
-            job.get(
-                "telecommuting",
-                False,
-            )
+        country = classify_country(
+            location=location,
+            country_code=country_code,
         )
 
-        if (
-            workplace_type.lower()
-            == "remote"
+        if not location_is_allowed(
+            country,
+            workplace,
         ):
-            remote = True
-
-        country, remote_ok = (
-            classify_job_location(
-                location,
-                remote=remote,
-                country_code=country_code,
-                workplace_type=workplace_type,
-            )
-        )
-
-        if not remote_ok:
             continue
 
         posted = parse_date(
@@ -2024,27 +2747,22 @@ def fetch_workable(
         ):
             continue
 
+        link = clean_text(
+            job.get(
+                "application_url"
+            )
+            or job.get("url")
+            or job.get("shortlink")
+        )
+
+        if not link:
+            continue
+
         job_id = str(
             job.get("shortcode")
             or job.get("code")
             or ""
         )
-
-        link = (
-            job.get(
-                "application_url"
-            )
-            or job.get(
-                "url"
-            )
-            or job.get(
-                "shortlink"
-            )
-            or ""
-        )
-
-        if not link:
-            continue
 
         results.append({
             "ats": "workable",
@@ -2053,6 +2771,7 @@ def fetch_workable(
             "title": title,
             "location": location,
             "country": country,
+            "workplace": workplace,
             "posted_date": posted,
             "job_url": link,
         })
@@ -2069,39 +2788,12 @@ FETCHERS = {
 
 
 # ============================================================
-# DISCOVER + VALIDATE ALL BOARDS
-# ============================================================
-
-def discover_all_boards():
-    boards = {}
-
-    for ats in ATS_SOURCES:
-
-        candidates = (
-            discover_boards_for_ats(
-                ats
-            )
-        )
-
-        valid = validate_boards(
-            ats,
-            candidates,
-        )
-
-        boards[ats] = valid
-
-    return boards
-
-
-# ============================================================
-# CRAWL ALL BOARDS
+# CRAWL
 # ============================================================
 
 def crawl_boards(
     boards,
 ):
-    all_jobs = []
-
     tasks = []
 
     for ats, slugs in boards.items():
@@ -2112,6 +2804,9 @@ def crawl_boards(
             ]
 
         for slug in slugs:
+
+            # Lever may exist on either global or EU instance.
+            # The fetcher first tries the normal endpoint.
             tasks.append(
                 (
                     ats,
@@ -2124,20 +2819,23 @@ def crawl_boards(
         f"{len(tasks)}"
     )
 
+    all_jobs = []
+
     with ThreadPoolExecutor(
         max_workers=CONCURRENCY
     ) as executor:
 
-        future_map = {}
+        futures = {}
 
         for ats, slug in tasks:
 
             future = executor.submit(
-                FETCHERS[ats],
+                crawl_one_board,
+                ats,
                 slug,
             )
 
-            future_map[future] = (
+            futures[future] = (
                 ats,
                 slug,
             )
@@ -2145,10 +2843,10 @@ def crawl_boards(
         completed = 0
 
         for future in as_completed(
-            future_map
+            futures
         ):
 
-            ats, slug = future_map[
+            ats, slug = futures[
                 future
             ]
 
@@ -2179,75 +2877,50 @@ def crawl_boards(
     return all_jobs
 
 
+def crawl_one_board(
+    ats,
+    slug,
+):
+    if ats == "lever":
+
+        jobs = fetch_lever(
+            slug,
+            eu=False,
+        )
+
+        if jobs:
+            return jobs
+
+        # If global endpoint returned nothing, try EU.
+        return fetch_lever(
+            slug,
+            eu=True,
+        )
+
+    return FETCHERS[
+        ats
+    ](slug)
+
+
 # ============================================================
-# CURRENT-RUN DEDUPLICATION
+# DEDUPLICATION
 # ============================================================
 
 def deduplicate_jobs(
     jobs,
 ):
-    """
-    Remove duplicates inside the current crawl.
-
-    Primary key:
-        ATS + Job ID
-
-    Secondary:
-        normalized URL
-
-    Fallback:
-        company + title + location
-    """
-
     unique = {}
-
-    url_keys = set()
-    fallback_keys = set()
 
     for job in jobs:
 
-        job_key = make_job_key(
-            job.get("ats", ""),
-            job.get("job_id", ""),
-            job.get("job_url", ""),
+        key = make_job_key(
+            job["ats"],
+            job["job_id"],
+            job["job_url"],
         )
 
-        url_key = normalize_url(
-            job.get("job_url", "")
-        ).lower()
-
-        fallback_key = (
-            make_fallback_job_key(
-                job
-            )
-        )
-
-        if job_key in unique:
-            continue
-
-        if (
-            url_key
-            and url_key in url_keys
-        ):
-            continue
-
-        if (
-            fallback_key
-            and fallback_key in fallback_keys
-        ):
-            continue
-
-        unique[job_key] = job
-
-        if url_key:
-            url_keys.add(
-                url_key
-            )
-
-        if fallback_key:
-            fallback_keys.add(
-                fallback_key
-            )
+        if key not in unique:
+            unique[key] = job
 
     return list(
         unique.values()
@@ -2255,22 +2928,26 @@ def deduplicate_jobs(
 
 
 # ============================================================
-# EXISTING GOOGLE SHEET JOBS
+# EXISTING JOB KEYS
 # ============================================================
+
+JOB_HEADERS = [
+    "Date",
+    "Company",
+    "Job Title",
+    "Location",
+    "Country",
+    "Posted Date",
+    "Job Link",
+    "Job ID",
+    "ATS",
+]
+
 
 def load_existing_keys(
     worksheet,
 ):
-    """
-    Read the existing Jobs sheet and build duplicate keys.
-
-    This is what prevents a job already added to the sheet
-    from being added again on the next daily run.
-    """
-
     existing = set()
-    existing_urls = set()
-    existing_fallbacks = set()
 
     try:
         rows = (
@@ -2278,148 +2955,108 @@ def load_existing_keys(
         )
 
         if not rows:
-            return (
-                existing,
-                existing_urls,
-                existing_fallbacks,
-            )
+            return existing
 
         headers = rows[0]
 
-        def find_header(
-            *names
-        ):
-            for name in names:
-                try:
-                    return headers.index(
-                        name
-                    )
-                except ValueError:
-                    continue
+        def idx(name):
+            try:
+                return headers.index(
+                    name
+                )
+            except ValueError:
+                return -1
 
-            return -1
-
-        ats_index = find_header(
-            "ATS"
-        )
-
-        id_index = find_header(
-            "Job ID"
-        )
-
-        url_index = find_header(
-            "Job Link",
-            "Job URL",
-        )
-
-        company_index = find_header(
-            "Company"
-        )
-
-        title_index = find_header(
-            "Job Title",
-            "Title",
-        )
-
-        location_index = find_header(
-            "Location"
-        )
+        ats_i = idx("ATS")
+        id_i = idx("Job ID")
+        url_i = idx("Job Link")
+        company_i = idx("Company")
+        title_i = idx("Job Title")
+        location_i = idx("Location")
 
         for row in rows[1:]:
 
             ats = (
-                row[ats_index]
-                if (
-                    ats_index >= 0
-                    and len(row)
-                    > ats_index
-                )
+                row[ats_i]
+                if ats_i >= 0
+                and len(row) > ats_i
                 else ""
             )
 
             job_id = (
-                row[id_index]
-                if (
-                    id_index >= 0
-                    and len(row)
-                    > id_index
-                )
+                row[id_i]
+                if id_i >= 0
+                and len(row) > id_i
                 else ""
             )
 
             url = (
-                row[url_index]
-                if (
-                    url_index >= 0
-                    and len(row)
-                    > url_index
-                )
+                row[url_i]
+                if url_i >= 0
+                and len(row) > url_i
                 else ""
             )
 
             company = (
-                row[company_index]
-                if (
-                    company_index >= 0
-                    and len(row)
-                    > company_index
-                )
+                row[company_i]
+                if company_i >= 0
+                and len(row) > company_i
                 else ""
             )
 
             title = (
-                row[title_index]
-                if (
-                    title_index >= 0
-                    and len(row)
-                    > title_index
-                )
+                row[title_i]
+                if title_i >= 0
+                and len(row) > title_i
                 else ""
             )
 
             location = (
-                row[location_index]
-                if (
-                    location_index >= 0
-                    and len(row)
-                    > location_index
-                )
+                row[location_i]
+                if location_i >= 0
+                and len(row) > location_i
                 else ""
             )
 
             if ats and job_id:
                 existing.add(
-                    f"{ats.lower()}:{job_id}"
+                    (
+                        "id",
+                        ats.lower().strip(),
+                        str(job_id).lower().strip(),
+                    )
                 )
 
-            normalized_url = (
-                normalize_url(
-                    url
-                ).lower()
+            normalized = (
+                normalize_url(url)
             )
 
-            if normalized_url:
-                existing_urls.add(
-                    normalized_url
+            if normalized:
+                existing.add(
+                    (
+                        "url",
+                        normalized,
+                    )
                 )
 
             if (
                 company
-                or title
-                or location
+                and title
+                and location
             ):
-                raw = (
-                    f"{normalize_for_duplicate(company)}|"
-                    f"{normalize_for_duplicate(title)}|"
-                    f"{normalize_for_duplicate(location)}"
-                )
-
-                existing_fallbacks.add(
-                    hashlib.sha256(
-                        raw.encode(
-                            "utf-8"
-                        )
-                    ).hexdigest()
+                existing.add(
+                    (
+                        "fallback",
+                        clean_text(
+                            company
+                        ).lower(),
+                        clean_text(
+                            title
+                        ).lower(),
+                        clean_text(
+                            location
+                        ).lower(),
+                    )
                 )
 
     except Exception as exc:
@@ -2428,58 +3065,94 @@ def load_existing_keys(
             f"Jobs sheet: {exc}"
         )
 
-    return (
-        existing,
-        existing_urls,
-        existing_fallbacks,
+    return existing
+
+
+def job_already_exists(
+    job,
+    existing_keys,
+):
+    ats = clean_text(
+        job["ats"]
+    ).lower()
+
+    job_id = clean_text(
+        job["job_id"]
+    ).lower()
+
+    url = normalize_url(
+        job["job_url"]
     )
 
+    company = clean_text(
+        job["company"]
+    ).lower()
+
+    title = clean_text(
+        job["title"]
+    ).lower()
+
+    location = clean_text(
+        job["location"]
+    ).lower()
+
+    if job_id and (
+        "id",
+        ats,
+        job_id,
+    ) in existing_keys:
+        return True
+
+    if url and (
+        "url",
+        url,
+    ) in existing_keys:
+        return True
+
+    if (
+        company
+        and title
+        and location
+        and (
+            "fallback",
+            company,
+            title,
+            location,
+        ) in existing_keys
+    ):
+        return True
+
+    return False
+
 
 # ============================================================
-# SHEET HEADER
+# SAVE JOBS
 # ============================================================
 
-NEW_HEADERS = [
-    "Added Date",
-    "Company",
-    "Job Title",
-    "Location",
-    "Country",
-    "Posted Date",
-    "Job Link",
-    "ATS",
-    "Job ID",
-]
-
-
-def ensure_sheet_headers(
+def ensure_job_headers(
     worksheet,
 ):
-    """
-    Ensure the Jobs sheet uses the new 9-column structure.
-
-    If the existing sheet still has the old 8-column header,
-    the new Added Date column is inserted at column A while
-    preserving the existing job data.
-    """
-
     values = (
         worksheet.get_all_values()
     )
 
     if not values:
-        worksheet.append_row(
-            NEW_HEADERS,
+        worksheet.update(
+            "A1",
+            [JOB_HEADERS],
             value_input_option="RAW",
         )
         return
 
-    current_headers = values[0]
+    headers = values[0]
 
-    if current_headers == NEW_HEADERS:
+    if headers == JOB_HEADERS:
         return
 
-    old_headers = [
+    # If the user has an older 8-column sheet, convert it safely
+    # by inserting Date at the beginning while preserving the
+    # existing columns where possible.
+    if headers == [
         "Company",
         "Job Title",
         "Location",
@@ -2488,236 +3161,176 @@ def ensure_sheet_headers(
         "Job Link",
         "ATS",
         "Job ID",
-    ]
+    ]:
 
-    if current_headers == old_headers:
+        today = (
+            datetime.now(
+                timezone.utc
+            ).date().isoformat()
+        )
 
-        # Insert a physical first column.
-        try:
-            worksheet.insert_cols(
-                ["" for _ in range(
-                    len(values)
-                )],
-                1,
-            )
+        converted = [
+            JOB_HEADERS
+        ]
 
-        except Exception:
-            # If insert_cols behaves differently with a
-            # particular gspread version, rebuild the rows.
-            rebuilt = []
+        for row in values[1:]:
+            padded = list(row)
 
-            rebuilt.append(
-                NEW_HEADERS
-            )
+            while len(padded) < 8:
+                padded.append("")
 
-            for row in values[1:]:
-                padded = (
-                    row
-                    + [""] * (
-                        8 - len(row)
-                    )
-                )
-
-                rebuilt.append([
-                    "",
+            converted.append(
+                [
+                    today,
                     padded[0],
                     padded[1],
                     padded[2],
                     padded[3],
                     padded[4],
                     padded[5],
-                    padded[6],
                     padded[7],
-                ])
-
-            worksheet.clear()
-
-            worksheet.update(
-                "A1",
-                rebuilt,
-                value_input_option="RAW",
+                    padded[6],
+                ]
             )
 
-            return
+        worksheet.clear()
 
-        # Write the new header.
         worksheet.update(
-            "A1:I1",
-            [NEW_HEADERS],
+            "A1",
+            converted,
             value_input_option="RAW",
         )
 
-        # Fill Added Date for old rows if empty.
-        # We use today's date because those rows were
-        # already imported before Added Date existed.
-        if len(values) > 1:
-            today = datetime.now(
-                timezone.utc
-            ).date().strftime(
-                DATE_FORMAT
-            )
-
-            added_dates = [
-                [today]
-                for _ in values[1:]
-            ]
-
-            worksheet.update(
-                f"A2:A{len(values)}",
-                added_dates,
-                value_input_option="RAW",
-            )
+        print(
+            "Converted old Jobs sheet "
+            "to the new Date-first format."
+        )
 
         return
 
     print(
-        "\nWARNING: Jobs sheet has an "
-        "unexpected header structure."
-    )
-
-    print(
+        "Existing Jobs header is custom. "
         "The crawler will preserve existing "
-        "data and will not delete it."
+        "columns and append only if the required "
+        "columns can be identified."
     )
 
-
-# ============================================================
-# SAVE NEW JOBS
-# ============================================================
 
 def save_jobs(
+    spreadsheet,
     jobs,
 ):
-    worksheet = get_google_sheet()
+    worksheet = get_or_create_worksheet(
+        spreadsheet,
+        "Jobs",
+        rows=5000,
+        cols=9,
+    )
 
-    # Ensure Added Date is the first column.
-    ensure_sheet_headers(
+    ensure_job_headers(
         worksheet
     )
 
-    (
-        existing_keys,
-        existing_urls,
-        existing_fallbacks,
-    ) = load_existing_keys(
-        worksheet
+    existing_keys = (
+        load_existing_keys(
+            worksheet
+        )
+    )
+
+    added_date = (
+        datetime.now(
+            timezone.utc
+        ).date().isoformat()
     )
 
     new_rows = []
 
-    added_date = datetime.now(
-        timezone.utc
-    ).date().strftime(
-        DATE_FORMAT
-    )
-
     for job in jobs:
 
-        ats = str(
-            job.get("ats", "")
-        ).strip()
-
-        job_id = str(
-            job.get("job_id", "")
-        ).strip()
-
-        job_url = str(
-            job.get("job_url", "")
-        ).strip()
-
-        id_key = (
-            f"{ats.lower()}:"
-            f"{job_id}"
-            if (
-                ats
-                and job_id
-            )
-            else ""
-        )
-
-        url_key = (
-            normalize_url(
-                job_url
-            ).lower()
-        )
-
-        fallback_key = (
-            make_fallback_job_key(
-                job
-            )
-        )
-
-        # ----------------------------------------------------
-        # DUPLICATE CHECK #1
-        # Existing ATS + Job ID
-        # ----------------------------------------------------
-
-        if (
-            id_key
-            and id_key in existing_keys
+        if job_already_exists(
+            job,
+            existing_keys,
         ):
             continue
 
-        # ----------------------------------------------------
-        # DUPLICATE CHECK #2
-        # Existing normalized URL
-        # ----------------------------------------------------
-
-        if (
-            url_key
-            and url_key in existing_urls
-        ):
-            continue
-
-        # ----------------------------------------------------
-        # DUPLICATE CHECK #3
-        # Existing company + title + location
-        # ----------------------------------------------------
-
-        if (
-            fallback_key
-            and fallback_key
-            in existing_fallbacks
-        ):
-            continue
-
-        new_rows.append([
+        row = [
             added_date,
-            job.get("company", ""),
-            job.get("title", ""),
-            job.get("location", ""),
-            job.get("country", ""),
-            job.get("posted_date", ""),
-            job.get("job_url", ""),
-            job.get("ats", ""),
-            job.get("job_id", ""),
-        ])
+            job["company"],
+            job["title"],
+            job["location"],
+            job["country"],
+            job["posted_date"],
+            job["job_url"],
+            job["job_id"],
+            job["ats"],
+        ]
 
-        # Add immediately so another matching job
-        # in this same run cannot be inserted again.
-        if id_key:
+        new_rows.append(
+            row
+        )
+
+        ats = clean_text(
+            job["ats"]
+        ).lower()
+
+        job_id = clean_text(
+            job["job_id"]
+        ).lower()
+
+        url = normalize_url(
+            job["job_url"]
+        )
+
+        company = clean_text(
+            job["company"]
+        ).lower()
+
+        title = clean_text(
+            job["title"]
+        ).lower()
+
+        location = clean_text(
+            job["location"]
+        ).lower()
+
+        if job_id:
             existing_keys.add(
-                id_key
+                (
+                    "id",
+                    ats,
+                    job_id,
+                )
             )
 
-        if url_key:
-            existing_urls.add(
-                url_key
+        if url:
+            existing_keys.add(
+                (
+                    "url",
+                    url,
+                )
             )
 
-        if fallback_key:
-            existing_fallbacks.add(
-                fallback_key
+        if (
+            company
+            and title
+            and location
+        ):
+            existing_keys.add(
+                (
+                    "fallback",
+                    company,
+                    title,
+                    location,
+                )
             )
 
     if not new_rows:
-
         print(
             "\nNo new matching jobs."
         )
-
         return 0
 
+    # Append in one API call rather than one row at a time.
     worksheet.append_rows(
         new_rows,
         value_input_option="RAW",
@@ -2744,116 +3357,113 @@ def main():
     print(
         "========================================"
     )
-
     print(
-        "REMOTE4.ME JOB CRAWLER"
+        "REMOTE4.ME QUALITY JOB CRAWLER"
     )
-
     print(
         "========================================"
     )
 
     print(
-        f"Started: "
+        f"Started UTC: "
         f"{started.isoformat()}"
     )
 
     print(
-        "\nATS:"
+        "\nScope:"
+    )
+    print(
+        "  Customer Support"
+    )
+    print(
+        "  Technical Support"
+    )
+    print(
+        "  Customer Success"
+    )
+    print(
+        "  Customer Experience"
+    )
+    print(
+        "  Customer Service"
+    )
+    print(
+        "  Onboarding / Implementation"
+    )
+    print(
+        "  Enablement / Adoption / Retention"
+    )
+
+    print(
+        "\nLocation rules:"
+    )
+    print(
+        "  USA = Remote only"
+    )
+    print(
+        "  India = Remote + Hybrid"
+    )
+
+    print(
+        f"\nJob age window: "
+        f"{MAX_JOB_AGE_DAYS} days"
+    )
+
+    print(
+        f"Board cache: "
+        f"{BOARD_CACHE_DAYS} days"
+    )
+
+    # --------------------------------------------------------
+    # GOOGLE SHEETS
+    # --------------------------------------------------------
+
+    print(
+        "\nSTEP 1 — Connecting to Google Sheets"
+    )
+
+    spreadsheet = get_spreadsheet()
+
+    # --------------------------------------------------------
+    # BOARD DISCOVERY / CACHE
+    # --------------------------------------------------------
+
+    print(
+        "\nSTEP 2 — Loading/discovering ATS boards"
+    )
+
+    boards = discover_or_load_boards(
+        spreadsheet
+    )
+
+    total_boards = sum(
+        len(items)
+        for items in boards.values()
+    )
+
+    print(
+        f"\nLive boards available: "
+        f"{total_boards}"
     )
 
     for ats in ATS_SOURCES:
         print(
-            f"  {ats}"
-        )
-
-    print(
-        "\nSmartRecruiters: REMOVED"
-    )
-
-    print(
-        "\nNiche:"
-    )
-
-    print(
-        "  Customer Support"
-    )
-
-    print(
-        "  Technical Support"
-    )
-
-    print(
-        "  Customer Success"
-    )
-
-    print(
-        "\nCountries:"
-    )
-
-    print(
-        "  India"
-    )
-
-    print(
-        "  USA"
-    )
-
-    print(
-        "\nRemote only: YES"
-    )
-
-    print(
-        f"Job age window: "
-        f"{MAX_JOB_AGE_DAYS} days"
-    )
-
-    # --------------------------------------------------------
-    # STEP 1
-    # --------------------------------------------------------
-
-    print(
-        "\nSTEP 1 — "
-        "Discovering ATS boards"
-    )
-
-    boards = (
-        discover_all_boards()
-    )
-
-    total_boards = sum(
-        len(x)
-        for x in boards.values()
-    )
-
-    print(
-        f"\nDiscovered/validated "
-        f"{total_boards} live boards."
-    )
-
-    for ats, slugs in boards.items():
-
-        print(
             f"  {ats}: "
-            f"{len(slugs)}"
+            f"{len(boards.get(ats, []))}"
         )
 
     if total_boards == 0:
-
         print(
-            "\nNo live ATS boards "
-            "were discovered."
+            "\nNo live boards available."
         )
-
         return
 
     # --------------------------------------------------------
-    # STEP 2
+    # CRAWL
     # --------------------------------------------------------
 
     print(
-        "\nSTEP 2 — "
-        "Crawling jobs"
+        "\nSTEP 3 — Crawling jobs"
     )
 
     jobs = crawl_boards(
@@ -2867,12 +3477,11 @@ def main():
     )
 
     # --------------------------------------------------------
-    # STEP 3
+    # DEDUPLICATE
     # --------------------------------------------------------
 
     print(
-        "\nSTEP 3 — "
-        "Removing duplicates"
+        "\nSTEP 4 — Deduplicating"
     )
 
     jobs = deduplicate_jobs(
@@ -2880,21 +3489,21 @@ def main():
     )
 
     print(
-        f"Unique jobs in this run: "
+        f"Unique jobs this run: "
         f"{len(jobs)}"
     )
 
     # --------------------------------------------------------
-    # STEP 4
+    # SAVE
     # --------------------------------------------------------
 
     print(
-        "\nSTEP 4 — "
-        "Updating Google Sheets"
+        "\nSTEP 5 — Updating Google Sheets"
     )
 
     added = save_jobs(
-        jobs
+        spreadsheet,
+        jobs,
     )
 
     # --------------------------------------------------------
@@ -2912,21 +3521,15 @@ def main():
     print(
         "\n========================================"
     )
-
     print(
-        "CRAWLER FINISHED"
+        "CRAWLER FINISHED SUCCESSFULLY"
     )
-
     print(
-        f"New jobs added: "
-        f"{added}"
+        f"New jobs added: {added}"
     )
-
     print(
-        f"Runtime: "
-        f"{duration:.1f} seconds"
+        f"Runtime: {duration:.1f} seconds"
     )
-
     print(
         "========================================"
     )
