@@ -68,7 +68,7 @@ CONCURRENCY = 16
 # Because the crawler runs every day and deduplicates against the
 # Sheet, 7 days gives a useful safety buffer without repeatedly
 # importing months of old jobs.
-MAX_JOB_AGE_DAYS = 7
+MAX_JOB_AGE_DAYS = 14
 
 # Board discovery refresh interval for re-validating existing boards.
 # Internet Archive discovery itself runs EVERY day.
@@ -294,8 +294,18 @@ TARGET_TITLE_PATTERNS = [
     r"\bprovider support specialist\b",
 
     # --------------------------------------------------------
-    # GENERAL SUPPORT
+    # GENERAL SUPPORT / TECHNICAL SUPPORT SHORT-FORM TITLES
     # --------------------------------------------------------
+    # These are common technical/customer-support titles that do not
+    # always contain the words "technical support".
+    r"\bcustomer support engineer\b",
+    r"\bcustomer support technician\b",
+    r"\bsupport engineer\b",
+    r"\bsupport technician\b",
+    r"\btechnical support technician\b",
+    r"\bproduct support technician\b",
+    r"\bapplication support technician\b",
+    r"\bplatform support technician\b",
     r"\bsupport specialist\b",
     r"\bsupport associate\b",
     r"\bsupport representative\b",
@@ -887,19 +897,38 @@ US_CITIES = [
 ]
 
 INDIA_COUNTRY_PATTERNS = [
+    # Do NOT use "IN" here. In job locations, "IN" is commonly
+    # the US state abbreviation for Indiana and caused false India matches.
     r"\bindia\b",
-    r"\bind\b",
-    r"\bindian\b",
 ]
 
 USA_COUNTRY_PATTERNS = [
     r"\bunited states\b",
     r"\bunited states of america\b",
     r"\busa\b",
-    r"\bu\.s\.a\.\b",
-    r"\bu\.s\.\b",
-    r"\bunited states remote\b",
+    r"(?<!\w)u\.s\.a\.(?!\w)",
+    r"(?<!\w)u\.s\.(?!\w)",
+    r"\bus\b",
 ]
+
+# US state abbreviations are useful for locations such as:
+#   "Remote - CA", "Austin, TX", "New York, NY"
+# They are deliberately checked with punctuation/whitespace context.
+# "IN" is therefore treated as Indiana when it appears as a location code,
+# while an explicit ATS country_code="IN" still correctly means India.
+US_STATE_CODES = [
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    "DC",
+]
+
+US_STATE_CODE_REGEX = re.compile(
+    r"(?:^|[\s,(/-])(?:" + "|".join(US_STATE_CODES) + r")(?:$|[\s,)/-])",
+    re.IGNORECASE,
+)
 
 REMOTE_PATTERNS = [
     r"\bremote\b",
@@ -917,6 +946,40 @@ HYBRID_PATTERNS = [
     r"\bpartially remote\b",
     r"\bremote hybrid\b",
 ]
+
+# These phrases are used only when the ATS location is generic, such as
+# "Remote". They are intentionally stronger than simply searching a job
+# description for the words "India" or "United States" because job
+# descriptions often mention multiple countries incidentally.
+REMOTE_INDIA_CONTEXT_REGEX = re.compile(
+    r"(?:"
+    r"remote(?:\s+role|\s+position|\s+job)?\s*(?:in|from|within)\s+india"
+    r"|india\s*[-–—,:()]?\s*remote"
+    r"|remote\s*[-–—,:()]?\s*india"
+    r"|india[-\s]+based"
+    r"|based\s+in\s+india"
+    r"|located\s+in\s+india"
+    r"|work\s+(?:remotely|remote)\s+from\s+india"
+    r"|must\s+be\s+based\s+in\s+india"
+    r"|position\s+is\s+remote\s+in\s+india"
+    r")",
+    re.IGNORECASE,
+)
+
+REMOTE_US_CONTEXT_REGEX = re.compile(
+    r"(?:"
+    r"remote(?:\s+role|\s+position|\s+job)?\s*(?:in|from|within)\s+(?:the\s+)?(?:u\.s\.?|u\.s\.a\.?|usa|us|united\s+states)"
+    r"|(?:u\.s\.?|u\.s\.a\.?|usa|us|united\s+states)\s*[-–—,:()]?\s*remote"
+    r"|remote\s*[-–—,:()]?\s*(?:u\.s\.?|u\.s\.a\.?|usa|us|united\s+states)"
+    r"|(?:u\.s\.?|u\.s\.a\.?|usa|us|united\s+states)[-\s]+based"
+    r"|based\s+in\s+(?:the\s+)?(?:u\.s\.?|u\.s\.a\.?|usa|us|united\s+states)"
+    r"|located\s+in\s+(?:the\s+)?(?:u\.s\.?|u\.s\.a\.?|usa|us|united\s+states)"
+    r"|work\s+(?:remotely|remote)\s+from\s+(?:the\s+)?(?:u\.s\.?|u\.s\.a\.?|usa|us|united\s+states)"
+    r"|must\s+be\s+based\s+in\s+(?:the\s+)?(?:u\.s\.?|u\.s\.a\.?|usa|us|united\s+states)"
+    r"|position\s+is\s+remote\s+in\s+(?:the\s+)?(?:u\.s\.?|u\.s\.a\.?|usa|us|united\s+states)"
+    r")",
+    re.IGNORECASE,
+)
 
 INDIA_REGEX = re.compile(
     "|".join(
@@ -945,6 +1008,7 @@ HYBRID_REGEX = re.compile(
     "|".join(HYBRID_PATTERNS),
     re.IGNORECASE,
 )
+
 
 
 # ============================================================
@@ -1210,57 +1274,248 @@ def has_hybrid_word(
     )
 
 
+def _normalize_workplace_value(value):
+    """Normalize common ATS workplace values into our internal labels."""
+    if isinstance(value, bool):
+        return "remote" if value else ""
+
+    value = clean_text(value).lower()
+    value = value.replace("_", " ").replace("-", " ")
+    value = re.sub(r"\s+", " ", value).strip()
+
+    if value in {
+        "remote",
+        "fully remote",
+        "100% remote",
+        "work from home",
+        "home based",
+        "home based role",
+    }:
+        return "remote"
+
+    if value in {
+        "hybrid",
+        "remote hybrid",
+        "partially remote",
+    }:
+        return "hybrid"
+
+    if value in {
+        "onsite",
+        "on site",
+        "on premises",
+        "office",
+        "in office",
+    }:
+        return "onsite"
+
+    return ""
+
+
+def extract_structured_workplace_signal(data):
+    """
+    Read workplace information from structured ATS fields/metadata.
+
+    This is primarily for Greenhouse, where the public job list does not
+    expose the same explicit workplaceType/isRemote fields that Ashby and
+    Lever expose. We only inspect fields whose names indicate workplace or
+    remote status; ordinary description text is never used here.
+    """
+    if not isinstance(data, (dict, list)):
+        return ""
+
+    workplace_keys = {
+        "workplacetype",
+        "workplace_type",
+        "workplace",
+        "work_location_type",
+        "worklocationtype",
+        "location_type",
+        "locationtype",
+        "work_mode",
+        "workmode",
+        "work_arrangement",
+        "workarrangement",
+        "remote_policy",
+        "remotepolicy",
+        "remote_status",
+        "remotestatus",
+    }
+
+    remote_flag_keys = {
+        "isremote",
+        "remote",
+        "telecommuting",
+        "remote_eligible",
+        "remoteeligible",
+        "remote_allowed",
+        "remoteallowed",
+    }
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            # Greenhouse custom metadata commonly looks like:
+            # {"name": "Workplace Type", "value": "Remote"}
+            # Handle that shape explicitly before walking nested fields.
+            meta_name = clean_text(
+                obj.get("name")
+                or obj.get("label")
+                or obj.get("field_name")
+                or obj.get("fieldName")
+            ).lower()
+            if meta_name and (
+                "workplace" in meta_name
+                or "work location" in meta_name
+                or "location type" in meta_name
+                or "work arrangement" in meta_name
+                or "remote" in meta_name
+            ):
+                meta_value = (
+                    obj.get("value")
+                    if "value" in obj
+                    else obj.get("answer")
+                )
+                signal = _normalize_workplace_value(meta_value)
+                if not signal:
+                    value_text = clean_text(meta_value).lower()
+                    if re.search(r"\bhybrid\b", value_text):
+                        signal = "hybrid"
+                    elif re.search(r"\bremote\b", value_text):
+                        signal = "remote"
+                    elif re.search(r"\bon[ -]?site\b", value_text):
+                        signal = "onsite"
+                if signal:
+                    return signal
+
+            # First pass: exact workplace-type fields have highest priority.
+            for key, value in obj.items():
+                key_norm = re.sub(
+                    r"[^a-z0-9]",
+                    "",
+                    str(key).lower(),
+                )
+                if key_norm in {
+                    "workplacetype",
+                    "workplacetypevalue",
+                    "worklocationtype",
+                    "locationtype",
+                    "workmode",
+                    "workarrangement",
+                }:
+                    signal = _normalize_workplace_value(value)
+                    if signal:
+                        return signal
+
+            # Second pass: explicit remote flags.
+            for key, value in obj.items():
+                key_norm = re.sub(
+                    r"[^a-z0-9]",
+                    "",
+                    str(key).lower(),
+                )
+                if key_norm in remote_flag_keys:
+                    if isinstance(value, bool):
+                        return "remote" if value else ""
+                    value_norm = clean_text(value).lower()
+                    if value_norm in {
+                        "true",
+                        "yes",
+                        "1",
+                        "remote",
+                        "fully remote",
+                    }:
+                        return "remote"
+
+            # Third pass: metadata/custom fields. Only inspect a value when
+            # its key itself clearly indicates workplace/remote information.
+            for key, value in obj.items():
+                key_norm_raw = str(key).lower()
+                key_norm = re.sub(r"[^a-z0-9_]", "", key_norm_raw)
+                key_has_workplace = (
+                    key_norm in workplace_keys
+                    or "workplace" in key_norm
+                    or "worklocation" in key_norm
+                    or "workarrangement" in key_norm
+                    or "locationtype" in key_norm
+                    or "remotestatus" in key_norm
+                    or "remoteeligib" in key_norm
+                )
+
+                if key_has_workplace:
+                    if isinstance(value, (dict, list)):
+                        signal = walk(value)
+                    else:
+                        signal = _normalize_workplace_value(value)
+                        if not signal:
+                            value_text = clean_text(value).lower()
+                            if re.search(r"\bhybrid\b", value_text):
+                                signal = "hybrid"
+                            elif re.search(r"\bremote\b", value_text):
+                                signal = "remote"
+                            elif re.search(r"\bon[ -]?site\b", value_text):
+                                signal = "onsite"
+                    if signal:
+                        return signal
+
+            # Finally recurse into metadata/custom-field containers.
+            for key, value in obj.items():
+                key_norm = str(key).lower()
+                if key_norm in {
+                    "metadata",
+                    "customfields",
+                    "custom_fields",
+                    "attributes",
+                    "fields",
+                    "data",
+                } or isinstance(value, (dict, list)):
+                    signal = walk(value)
+                    if signal:
+                        return signal
+
+        elif isinstance(obj, list):
+            for item in obj:
+                signal = walk(item)
+                if signal:
+                    return signal
+
+        return ""
+
+    return walk(data)
+
+
 def classify_country(
     location="",
     country_code="",
     address_country="",
     description="",
+    workplace="",
 ):
     """
-    Country classification is deliberately conservative.
+    Classify only India or USA.
 
     Priority:
-      1. Explicit country code
-      2. Explicit address country
-      3. Location/city/state
-      4. Description only when needed
+      1. Explicit ATS country code
+      2. Explicit structured address country
+      3. Location/city/state/country wording
+      4. Strong country-eligibility wording for remote/hybrid jobs
+
+    IMPORTANT:
+      We do not scan arbitrary descriptions for the words "India" or
+      "United States" anymore. A normal job description can mention many
+      countries and doing so creates incorrect country assignments.
     """
+    code = clean_text(country_code).upper()
+    addr = clean_text(address_country).lower()
+    location = clean_text(location)
+    description = clean_text(description)
 
-    code = clean_text(
-        country_code
-    ).upper()
-
-    addr = clean_text(
-        address_country
-    ).lower()
-
-    location = clean_text(
-        location
-    )
-
-    description = clean_text(
-        description
-    )
-
-    if code in {
-        "IN",
-        "IND",
-        "INDIA",
-    }:
+    if code in {"IN", "IND", "INDIA"}:
         return "India"
 
-    if code in {
-        "US",
-        "USA",
-        "UNITED STATES",
-    }:
+    if code in {"US", "USA", "UNITED STATES", "UNITED STATES OF AMERICA"}:
         return "USA"
 
-    if addr in {
-        "in",
-        "ind",
-        "india",
-    }:
+    if addr in {"in", "ind", "india"}:
         return "India"
 
     if addr in {
@@ -1271,29 +1526,36 @@ def classify_country(
     }:
         return "USA"
 
-    if INDIA_REGEX.search(location):
+    # Location is the strongest unstructured source.
+    india_match = bool(INDIA_REGEX.search(location))
+    usa_match = bool(USA_REGEX.search(location)) or bool(
+        US_STATE_CODE_REGEX.search(location)
+    )
+
+    # If both countries are explicitly present in a multi-location field,
+    # do not guess. A later structured/strong remote-country signal can
+    # still resolve it.
+    if india_match and not usa_match:
         return "India"
 
-    if USA_REGEX.search(location):
+    if usa_match and not india_match:
         return "USA"
 
-    # Only use description for ambiguous remote/hybrid jobs.
-    # This helps ATS entries such as "Remote" where the actual
-    # country eligibility is mentioned in the text.
-    if description:
-
-        first_part = (
-            description[:12000]
+    # A generic remote/hybrid location such as "Remote" needs a strong
+    # country eligibility phrase from the posting. This is deliberately
+    # narrow to avoid the old false-positive behaviour.
+    if workplace in {"remote", "hybrid"} and description:
+        india_context = bool(
+            REMOTE_INDIA_CONTEXT_REGEX.search(description[:20000])
+        )
+        usa_context = bool(
+            REMOTE_US_CONTEXT_REGEX.search(description[:20000])
         )
 
-        if INDIA_REGEX.search(
-            first_part
-        ):
+        if india_context and not usa_context:
             return "India"
 
-        if USA_REGEX.search(
-            first_part
-        ):
+        if usa_context and not india_context:
             return "USA"
 
     return ""
@@ -1304,6 +1566,7 @@ def classify_workplace(
     workplace_type="",
     remote_flag=False,
     description="",
+    structured_data=None,
 ):
     """
     Returns:
@@ -1312,40 +1575,40 @@ def classify_workplace(
       onsite
       unknown
 
-    IMPORTANT:
-      Workplace classification is intentionally exact/conservative.
+    Priority:
+      1. Explicit ATS workplaceType/workplace field
+      2. Explicit ATS remote flag (isRemote/telecommuting/etc.)
+      3. Other structured ATS workplace metadata
+      4. Explicit remote/hybrid wording in the ATS LOCATION field
 
-      Priority:
-        1. ATS structured workplace type
-        2. ATS remote flag
-        3. Explicit remote/hybrid wording in the LOCATION field
-
-      The job title and job description are NOT used to classify a job
-      as remote or hybrid. This prevents false positives where an
-      onsite job mentions "remote" in its description or title.
+    The ordinary job description is never used as a workplace signal.
     """
+    workplace = _normalize_workplace_value(workplace_type)
+    if workplace:
+        return workplace
 
-    workplace = clean_text(
-        workplace_type
-    ).lower()
+    if isinstance(remote_flag, str):
+        remote_flag_value = remote_flag.strip().lower() in {
+            "true",
+            "yes",
+            "1",
+            "remote",
+            "fully remote",
+        }
+    else:
+        remote_flag_value = bool(remote_flag)
 
-    if workplace in {
-        "remote",
-        "fully remote",
-    }:
+    if remote_flag_value:
         return "remote"
 
-    if workplace in {
-        "hybrid",
-    }:
-        return "hybrid"
-
-    if remote_flag:
-        return "remote"
+    structured_signal = extract_structured_workplace_signal(
+        structured_data
+    )
+    if structured_signal:
+        return structured_signal
 
     # Only the actual ATS location field can provide an unstructured
-    # remote/hybrid signal. Do not infer workplace from title or
-    # description.
+    # remote/hybrid signal. Description/title are intentionally excluded.
     if has_hybrid_word(location):
         return "hybrid"
 
@@ -2445,10 +2708,12 @@ def fetch_greenhouse(
 
         workplace = classify_workplace(
             location=location,
+            structured_data=job,
         )
 
         country = classify_country(
             location=location,
+            workplace=workplace,
         )
 
         # Only relevant-but-ambiguous Greenhouse postings get a
@@ -2496,14 +2761,24 @@ def fetch_greenhouse(
                     department_text,
                 ])
 
+                # Greenhouse exposes useful custom/metadata fields on the
+                # detailed posting. Read only structured workplace signals
+                # from them; do not treat ordinary description text as proof
+                # that a job is remote.
                 workplace = classify_workplace(
                     location=location,
-                    description=detail_text,
+                    structured_data={
+                        "job": job,
+                        "detail": detail,
+                        "metadata": detail.get("metadata") or [],
+                        "offices": detail.get("offices") or [],
+                    },
                 )
 
                 country = classify_country(
                     location=location,
                     description=detail_text,
+                    workplace=workplace,
                 )
 
         if not location_is_allowed(
@@ -2701,19 +2976,18 @@ def fetch_ashby(
             workplace_type=job.get(
                 "workplaceType"
             ),
-            remote_flag=bool(
-                job.get(
-                    "isRemote",
-                    False,
-                )
+            remote_flag=job.get(
+                "isRemote",
+                False,
             ),
-            description=description,
+            structured_data=job,
         )
 
         country = classify_country(
             location=location,
             address_country=address_country,
             description=description,
+            workplace=workplace,
         )
 
         if not location_is_allowed(
@@ -2834,13 +3108,14 @@ def fetch_lever(
             workplace_type=job.get(
                 "workplaceType"
             ),
-            description=description,
+            structured_data=job,
         )
 
         country = classify_country(
             location=location,
             country_code=country_code,
             description=description,
+            workplace=workplace,
         )
 
         if not location_is_allowed(
@@ -2959,17 +3234,17 @@ def fetch_workable(
             workplace_type=job.get(
                 "workplace_type"
             ),
-            remote_flag=bool(
-                job.get(
-                    "telecommuting",
-                    False,
-                )
+            remote_flag=job.get(
+                "telecommuting",
+                False,
             ),
+            structured_data=job,
         )
 
         country = classify_country(
             location=location,
             country_code=country_code,
+            workplace=workplace,
         )
 
         if not location_is_allowed(
@@ -3678,7 +3953,7 @@ def main():
 
     print(
         f"\nJob age window: "
-        f"{MAX_JOB_AGE_DAYS} days"
+        f"{MAX_JOB_AGE_DAYS} days (deduplicated against existing Jobs)"
     )
 
     print(
