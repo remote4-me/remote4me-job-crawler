@@ -26,8 +26,9 @@ from google.oauth2.service_account import Credentials
 #   - Closely related support roles
 #
 # Locations:
-#   - USA: REMOTE only
+#   - USA: REMOTE + HYBRID
 #   - India: REMOTE + HYBRID
+#   - Separate Google Sheets tabs for each country/workplace combination
 #
 # ATS:
 #   - Greenhouse
@@ -82,7 +83,20 @@ MAX_BOARDS_PER_RUN = 0
 # the next discovery refresh. This avoids carrying dead boards.
 MAX_BOARD_FAILURES = 3
 
-USER_AGENT = "Remote4.me Job Crawler/3.1"
+USER_AGENT = "Remote4.me Job Crawler/3.2"
+
+# Companies that must never enter any output tab.
+# Match normalized company/board slugs and job URLs.
+EXCLUDED_COMPANY_TOKENS = {
+    "aogarciaagency",
+}
+
+OUTPUT_TABS = {
+    ("India", "remote"): "Remote India",
+    ("USA", "remote"): "Remote USA",
+    ("India", "hybrid"): "Hybrid India",
+    ("USA", "hybrid"): "Hybrid USA",
+}
 
 SMART_RETRY_STATUS_CODES = {
     408,
@@ -595,6 +609,36 @@ TARGET_TITLE_PATTERNS = [
     r"\btrust & safety specialist\b",
     r"\btrust and safety operations\b",
     r"\btrust & safety operations\b",
+
+    # Additional support and customer-success variations
+    r"\bsaas support\b", r"\bsaas support specialist\b",
+    r"\bsaas support engineer\b", r"\bcloud support\b",
+    r"\bcloud support engineer\b", r"\bproduction support engineer\b",
+    r"\bdesktop support\b", r"\bdesktop support engineer\b",
+    r"\bdesktop support technician\b", r"\bl1 support\b",
+    r"\bl2 support\b", r"\blevel 1 support\b", r"\blevel 2 support\b",
+    r"\bchat support\b", r"\bchat support agent\b",
+    r"\bemail support\b", r"\bemail support specialist\b",
+    r"\bvoice support\b", r"\bnon voice support\b",
+    r"\bnon-voice support\b", r"\bpayments support\b",
+    r"\bpayment support specialist\b", r"\bfintech support\b",
+    r"\bsolutions support engineer\b", r"\bsolution support specialist\b",
+    r"\btechnical onboarding specialist\b", r"\bimplementation engineer\b",
+    r"\bimplementation consultant\b", r"\bimplementation analyst\b",
+    r"\bcustomer support operations\b", r"\bcustomer support quality analyst\b",
+    r"\bcustomer support trainer\b", r"\bsupport training specialist\b",
+    r"\bknowledge base specialist\b", r"\bknowledge management specialist\b",
+    r"\bcustomer adoption specialist\b", r"\bcustomer education specialist\b",
+    r"\bcustomer advocacy specialist\b", r"\bcustomer retention specialist\b",
+    r"\bpartner support associate\b", r"\bpartner support representative\b",
+    r"\bmerchant support associate\b", r"\bmerchant support executive\b",
+    r"\btechnical account specialist\b", r"\btechnical account support\b",
+    r"\bclient success operations\b", r"\bcustomer success enablement\b",
+    r"\bcustomer onboarding consultant\b", r"\bcustomer implementation\b",
+    r"\bclient implementation\b", r"\bcontact center specialist\b",
+    r"\bcontact centre specialist\b", r"\bcall center support\b",
+    r"\bcall centre support\b", r"\btechnical support operations\b",
+    r"\bsoftware customer support\b", r"\bsaas customer support\b",
 ]
 
 
@@ -750,6 +794,22 @@ INDIA_CITIES = [
     "visakhapatnam",
     "vizag",
     "warangal",
+    # Additional Indian cities and common hiring hubs
+    "agra", "ajmer", "aligarh", "alwar", "ambala", "anand", "asansol",
+    "bareilly", "belgaum", "belagavi", "berhampur", "bhagalpur", "bharuch",
+    "bhavnagar", "bhopal", "bijapur", "bilaspur", "burdwan", "calicut",
+    "cannanore", "dhanbad", "dhule", "dibrugarh", "dimapur", "durgapur",
+    "erode", "etawah", "gaya", "gorakhpur", "haldwani", "hisar", "hosur",
+    "imphal", "jabalpur", "jalgaon", "jhansi", "jodhpur", "kakinada",
+    "karnal", "karur", "khammam", "kolhapur", "kollam", "kottayam",
+    "kurnool", "latur", "mathura", "moradabad", "muzaffarnagar", "muzaffarpur",
+    "nellore", "palakkad", "panipat", "panchkula", "panaji", "ratlam",
+    "rohtak", "rourkela", "saharanpur", "sangli", "satara", "shimla",
+    "siliguri", "sirsa", "solapur", "sonipat", "tiruchirappalli", "trichy",
+    "tirunelveli", "tiruppur", "ujjain", "vapi", "vellore", "yamunanagar",
+    "greater noida", "secunderabad", "electronic city", "whitefield",
+    "hebbal", "marathahalli", "hinjewadi", "wakad", "baner", "gachibowli",
+    "madhapur", "hitech city", "annanagar", "omr", "sholinganallur",
 ]
 
 US_STATES = [
@@ -894,6 +954,34 @@ US_CITIES = [
     "redwood city",
     "menlo park",
     "cupertino",
+    # Additional US metro areas and regional hiring hubs
+    "fort lauderdale", "west palm beach", "st petersburg", "clearwater",
+    "jacksonville", "tallahassee", "savannah", "augusta", "athens",
+    "birmingham", "huntsville", "little rock", "fayetteville", "louisville",
+    "lexington", "grand rapids", "ann arbor", "lansing", "des moines",
+    "cedar rapids", "wichita", "topeka", "lawrence", "tulsa", "norman",
+    "stillwater", "provo", "ogden", "reno", "henderson", "santa fe",
+    "las cruces", "lubbock", "amarillo", "corpus christi", "plano",
+    "frisco", "irving", "arlington", "round rock", "mckinney", "garland",
+    "richardson", "fort collins", "littleton", "aurora", "greeley",
+    "eugene", "salem", "bend", "vancouver", "everett", "bellevue",
+    "redmond", "kirkland", "olympia", "bellingham", "fresno", "bakersfield",
+    "long beach", "santa monica", "santa barbara", "santa rosa", "ventura",
+    "stockton", "modesto", "chula vista", "oceanside", "carlsbad",
+    "escondido", "tempe", "mesa", "scottsdale", "chandler", "gilbert",
+    "glendale", "peoria", "surprise", "annapolis", "frederick", "rockville",
+    "silver spring", "alexandria", "fairfax", "reston", "ashburn", "herndon",
+    "tysons", "new haven", "stamford", "norwalk", "waterbury", "worcester",
+    "springfield", "lowell", "burlington", "manchester", "concord",
+    "portsmouth", "wilmington", "trenton", "camden", "hoboken", "paterson",
+    "white plains", "yonkers", "syracuse", "ithaca", "schenectady",
+    "binghamton", "scranton", "allentown", "lancaster", "erie", "harrisburg",
+    "reading", "wilmington nc", "asheville", "greensboro", "winston-salem",
+    "greenville", "columbia", "charleston", "myrtle beach", "knoxville",
+    "chattanooga", "franklin", "bloomington", "evansville", "fort wayne",
+    "south bend", "green bay", "appleton", "eau claire", "duluth",
+    "rochester mn", "sioux falls", "fargo", "bismarck", "missoula", "helena",
+    "great falls", "cheyenne", "casper", "fairbanks", "kailua", "kaneohe",
 ]
 
 INDIA_COUNTRY_PATTERNS = [
@@ -1151,6 +1239,20 @@ def clean_text(value):
     )
 
     return value.strip()
+
+
+def is_excluded_company(company="", job_url="", board_slug=""):
+    """Exclude configured companies using normalized company/slug/URL tokens."""
+    haystack = " ".join([
+        clean_text(company),
+        clean_text(board_slug),
+        clean_text(job_url),
+    ]).lower()
+    compact = re.sub(r"[^a-z0-9]", "", haystack)
+    return any(
+        re.sub(r"[^a-z0-9]", "", token.lower()) in compact
+        for token in EXCLUDED_COMPANY_TOKENS
+    )
 
 
 def normalize_url(url):
@@ -1622,16 +1724,9 @@ def location_is_allowed(
     country,
     workplace,
 ):
-    # USA: remote only.
-    if country == "USA":
-        return workplace == "remote"
-
-    # India: remote OR hybrid.
-    if country == "India":
-        return workplace in {
-            "remote",
-            "hybrid",
-        }
+    # Both target markets have separate Remote and Hybrid tabs.
+    if country in {"USA", "India"}:
+        return workplace in {"remote", "hybrid"}
 
     return False
 
@@ -3324,6 +3419,9 @@ def crawl_boards(
             ]
 
         for slug in slugs:
+            if is_excluded_company(board_slug=slug):
+                print(f"Skipping excluded company board: {ats}/{slug}")
+                continue
 
             # Lever may exist on either global or EU instance.
             # The fetcher first tries the normal endpoint.
@@ -3432,6 +3530,11 @@ def deduplicate_jobs(
     unique = {}
 
     for job in jobs:
+        if is_excluded_company(
+            company=job.get("company", ""),
+            job_url=job.get("job_url", ""),
+        ):
+            continue
 
         key = make_job_key(
             job["ats"],
@@ -3763,132 +3866,94 @@ def ensure_job_headers(worksheet):
     )
 
 
-def save_jobs(
-    spreadsheet,
-    jobs,
-):
-    worksheet = get_or_create_worksheet(
-        spreadsheet,
-        "Jobs",
-        rows=5000,
-        cols=9,
-    )
-
-    ensure_job_headers(
-        worksheet
-    )
-
-    existing_keys = (
-        load_existing_keys(
-            worksheet
-        )
-    )
-
-    added_date = (
-        datetime.now(
-            timezone.utc
-        ).date().isoformat()
-    )
-
+def append_new_jobs_to_worksheet(worksheet, jobs, tab_name):
+    """Append only unseen jobs to a destination worksheet."""
+    ensure_job_headers(worksheet)
+    existing_keys = load_existing_keys(worksheet)
+    added_date = datetime.now(timezone.utc).date().isoformat()
     new_rows = []
 
     for job in jobs:
+        if is_excluded_company(
+            company=job.get("company", ""),
+            job_url=job.get("job_url", ""),
+        ):
+            continue
+        if job_already_exists(job, existing_keys):
+            continue
 
-        if job_already_exists(
-            job,
-            existing_keys,
+        new_rows.append([
+            added_date,
+            job.get("company", ""),
+            job.get("title", ""),
+            job.get("location", ""),
+            job.get("country", ""),
+            job.get("posted_date", ""),
+            job.get("job_url", ""),
+            job.get("job_id", ""),
+            job.get("ats", ""),
+        ])
+
+        ats = clean_text(job.get("ats", "")).lower()
+        job_id = clean_text(job.get("job_id", "")).lower()
+        url = normalize_url(job.get("job_url", ""))
+        company = clean_text(job.get("company", "")).lower()
+        title = clean_text(job.get("title", "")).lower()
+        location = clean_text(job.get("location", "")).lower()
+
+        if ats and job_id:
+            existing_keys.add(("id", ats, job_id))
+        if url:
+            existing_keys.add(("url", url))
+        if company and title and location:
+            existing_keys.add(("fallback", company, title, location))
+
+    if new_rows:
+        worksheet.append_rows(new_rows, value_input_option="RAW")
+
+    print(f"  {tab_name}: added {len(new_rows)} new jobs")
+    return len(new_rows)
+
+
+def save_jobs(spreadsheet, jobs):
+    # Keep the original Jobs master tab for backwards compatibility.
+    master = get_or_create_worksheet(
+        spreadsheet, "Jobs", rows=5000, cols=9
+    )
+    ensure_job_headers(master)
+    master_added = append_new_jobs_to_worksheet(master, jobs, "Jobs (master)")
+
+    # Create and populate four independent country/workplace tabs.
+    grouped = {key: [] for key in OUTPUT_TABS}
+    for job in jobs:
+        if is_excluded_company(
+            company=job.get("company", ""),
+            job_url=job.get("job_url", ""),
         ):
             continue
 
-        row = [
-            added_date,
-            job["company"],
-            job["title"],
-            job["location"],
-            job["country"],
-            job["posted_date"],
-            job["job_url"],
-            job["job_id"],
-            job["ats"],
-        ]
+        country = clean_text(job.get("country", ""))
+        workplace = clean_text(job.get("workplace", "")).lower()
 
-        new_rows.append(
-            row
+        key = (country, workplace)
+        if key in grouped:
+            grouped[key].append(job)
+
+    total_tab_added = 0
+    for key, tab_name in OUTPUT_TABS.items():
+        worksheet = get_or_create_worksheet(
+            spreadsheet, tab_name, rows=5000, cols=9
         )
-
-        ats = clean_text(
-            job["ats"]
-        ).lower()
-
-        job_id = clean_text(
-            job["job_id"]
-        ).lower()
-
-        url = normalize_url(
-            job["job_url"]
+        ensure_job_headers(worksheet)
+        total_tab_added += append_new_jobs_to_worksheet(
+            worksheet, grouped[key], tab_name
         )
-
-        company = clean_text(
-            job["company"]
-        ).lower()
-
-        title = clean_text(
-            job["title"]
-        ).lower()
-
-        location = clean_text(
-            job["location"]
-        ).lower()
-
-        if job_id:
-            existing_keys.add(
-                (
-                    "id",
-                    ats,
-                    job_id,
-                )
-            )
-
-        if url:
-            existing_keys.add(
-                (
-                    "url",
-                    url,
-                )
-            )
-
-        if (
-            company
-            and title
-            and location
-        ):
-            existing_keys.add(
-                (
-                    "fallback",
-                    company,
-                    title,
-                    location,
-                )
-            )
-
-    if not new_rows:
-        print(
-            "\nNo new matching jobs."
-        )
-        return 0
-
-    # Append in one API call rather than one row at a time.
-    worksheet.append_rows(
-        new_rows,
-        value_input_option="RAW",
-    )
 
     print(
-        f"\nAdded {len(new_rows)} "
-        f"new jobs to Google Sheets."
+        f"\nMaster Jobs tab: {master_added} new rows; "
+        f"four destination tabs: {total_tab_added} new rows."
     )
-
-    return len(new_rows)
+    return master_added
 
 
 # ============================================================
@@ -3945,10 +4010,16 @@ def main():
         "\nLocation rules:"
     )
     print(
-        "  USA = Remote only"
+        "  USA = Remote + Hybrid"
     )
     print(
         "  India = Remote + Hybrid"
+    )
+    print(
+        "  Output tabs: Remote India, Remote USA, Hybrid India, Hybrid USA"
+    )
+    print(
+        "  Excluded companies: aogarciaagency"
     )
 
     print(
