@@ -1294,7 +1294,7 @@ def request_json(
 INDIA_DISCOVERY_HEADERS = [
     "Added Date", "Company", "Job Title", "Location", "Country",
     "Workplace", "Posted Date", "Job Link", "Source API",
-    "Search Query", "Snippet / Description", "Review Status",
+    "Search Query", "Snippet / Description", "Review Status", "Page Type",
 ]
 
 # One rotating search query per provider per daily run. The query bank covers
@@ -1332,6 +1332,16 @@ INDIA_DISCOVERY_QUERIES = [
     'site:jobs.ashbyhq.com India support OR customer success OR product support',
     'site:boards.greenhouse.io OR site:job-boards.greenhouse.io India support jobs',
     'site:jobs.lever.co India customer support OR technical support OR BPO',
+    'site:myworkdayjobs.com India customer support OR technical support OR quality analyst careers',
+    'site:jobs.smartrecruiters.com India customer support OR BPO OR quality analyst',
+    'site:jobs.ashbyhq.com India customer support OR product support OR customer success',
+    'site:apply.workable.com India customer support OR technical support OR team leader',
+    'India customer support jobs company careers page apply',
+    'India BPO team leader SME quality analyst official careers',
+    'India remote technical support jobs employer careers apply',
+    'India hybrid customer success jobs official company careers',
+    'India contact centre quality analyst jobs company career site',
+    'India process trainer workforce management jobs official careers',
     'site:apply.workable.com India customer support OR quality analyst OR team leader',
 ]
 
@@ -1618,6 +1628,32 @@ def discover_india_api_jobs():
     return jobs
 
 
+def _is_ats_or_career_page(url):
+    """True for direct ATS job-board URLs or employer career/job pages."""
+    try:
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower().removeprefix("www.")
+        path = (parsed.path or "").lower()
+    except Exception:
+        return False
+
+    ats_hosts = (
+        "greenhouse.io", "ashbyhq.com", "lever.co", "workable.com",
+        "myworkdayjobs.com", "smartrecruiters.com", "recruitee.com",
+        "personio.", "teamtailor.com", "breezy.hr", "icims.com",
+        "jobvite.com", "taleo.net", "successfactors.com",
+    )
+    career_path = re.search(
+        r"/(careers?|jobs?|job-openings?|open-positions?|vacancies|"
+        r"opportunities|join-our-team)(/|$)",
+        path,
+    )
+    return (
+        any(host == d or host.endswith("." + d) for d in ats_hosts)
+        or bool(career_path)
+    )
+
+
 def _normalize_india_discovery_job(job):
     title = clean_text(job.get("title"))
     url = normalize_url(job.get("url") or job.get("job_url") or "")
@@ -1626,9 +1662,10 @@ def _normalize_india_discovery_job(job):
     country_hint = clean_text(job.get("country"))
     source_text = " ".join([title, location, snippet[:2500], url, country_hint])
 
-    if not title_is_relevant(title):
-        return None
     if not url.startswith(("http://", "https://")):
+        return None
+    is_career_page = _is_ats_or_career_page(url)
+    if not title_is_relevant(title) and not is_career_page:
         return None
     # Search APIs return ordinary employer career pages as well as ATS URLs.
     # Accept any real HTTP(S) result URL; exclude search engines/social/profile
@@ -1664,6 +1701,9 @@ def _normalize_india_discovery_job(job):
 
     workplace = clean_text(job.get("workplace")).lower()
     workplace_text = " ".join([location, title, snippet[:1200]])
+    page_type = "ATS / Career Page" if is_career_page and not title_is_relevant(title) else (
+        "ATS Job Listing" if is_career_page else "Direct Job / Search Result"
+    )
     if workplace not in {"remote", "hybrid"}:
         if has_hybrid_word(workplace_text):
             workplace = "hybrid"
@@ -1681,7 +1721,7 @@ def _normalize_india_discovery_job(job):
     return {
         "added_date": datetime.now(timezone.utc).date().isoformat(),
         "company": clean_text(job.get("company")) or _guess_company_from_url(url),
-        "title": title,
+        "title": title if title_is_relevant(title) else "CAREERS / ATS BOARD — " + title,
         "location": location or "India (location to verify)",
         "country": "India",
         "workplace": workplace,
@@ -1692,9 +1732,10 @@ def _normalize_india_discovery_job(job):
         "snippet": snippet[:4000],
         "status": (
             "Verify India location and work mode"
-            if inferred_india_from_query or workplace == "Needs review"
+            if inferred_india_from_query or workplace == "Needs review" or page_type == "ATS / Career Page"
             else "Needs manual review"
         ),
+        "page_type": page_type,
     }
 
 
@@ -1705,7 +1746,12 @@ def save_india_discovery(spreadsheet, discovered_jobs):
         cols=max(len(INDIA_DISCOVERY_HEADERS), 20),
     )
     existing = india_sheet.get_all_values()
-    if not existing:
+    header_is_blank = (
+        not existing
+        or not existing[0]
+        or not any(clean_text(cell) for cell in existing[0])
+    )
+    if header_is_blank:
         india_sheet.update(
             range_name="A1",
             values=[INDIA_DISCOVERY_HEADERS],
@@ -1728,6 +1774,7 @@ def save_india_discovery(spreadsheet, discovered_jobs):
         "query": {"searchquery", "query", "keyword"},
         "snippet": {"snippetdescription", "description", "snippet", "jobdescription"},
         "status": {"reviewstatus", "status", "verificationstatus"},
+        "page_type": {"pagetype", "resulttype", "linktype", "sourcetype"},
     }
     field_indexes = {}
     for field, names in aliases.items():
@@ -1783,6 +1830,7 @@ def save_india_discovery(spreadsheet, discovered_jobs):
             "posted": job["posted"], "url": job["url"],
             "source": job["source"], "query": job["query"],
             "snippet": job["snippet"], "status": job["status"],
+            "page_type": job.get("page_type", ""),
         }
         for field, value in values.items():
             idx = field_indexes.get(field)
@@ -1799,6 +1847,127 @@ def save_india_discovery(spreadsheet, discovered_jobs):
         "India Remote + Hybrid are combined; verify any marked leads manually."
     )
     return len(new_rows)
+
+
+def _verified_india_ats_job_from_discovery(raw_job):
+    """Promote only a direct ATS vacancy with explicit India + work-mode evidence.
+
+    Search-discovered company career pages, board roots, and ambiguous results
+    remain in India Discovery for human review. This prevents search snippets
+    from becoming published-looking job rows.
+    """
+    title = clean_text(raw_job.get("title"))
+    url = normalize_url(raw_job.get("url") or raw_job.get("job_url") or "")
+    location = clean_text(raw_job.get("location"))
+    country_hint = clean_text(raw_job.get("country"))
+    explicit_workplace = clean_text(raw_job.get("workplace")).lower()
+
+    if not title or not title_is_relevant(title):
+        return None
+    if not url.startswith(("https://", "http://")):
+        return None
+
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower().removeprefix("www.")
+    path = (parsed.path or "").strip("/")
+    if not host or not path:
+        return None
+
+    # Only promote direct job pages on supported ATS domains. Do not promote
+    # employer homepages, career landing pages, aggregators, or search pages.
+    ats_domains = {
+        "greenhouse.io": "Greenhouse",
+        "ashbyhq.com": "Ashby",
+        "lever.co": "Lever",
+        "workable.com": "Workable",
+        "smartrecruiters.com": "SmartRecruiters",
+        "recruitee.com": "Recruitee",
+        "personio.": "Personio",
+        "teamtailor.com": "Teamtailor",
+        "breezy.hr": "Breezy",
+        "icims.com": "iCIMS",
+        "jobvite.com": "Jobvite",
+        "myworkdayjobs.com": "Workday",
+        "successfactors.com": "SuccessFactors",
+        "taleo.net": "Taleo",
+    }
+    ats_name = next(
+        (name for domain, name in ats_domains.items()
+         if host == domain or host.endswith("." + domain) or
+         (domain.endswith(".") and domain in host)),
+        "",
+    )
+    if not ats_name:
+        return None
+
+    # Explicitly require a job-like URL path, not merely an ATS board root.
+    path_lower = path.lower()
+    job_path_patterns = (
+        r"/jobs?/",
+        r"/job/",
+        r"/posting/",
+        r"/positions?/",
+        r"/requisition/",
+        r"/careers?/.*",
+    )
+    if not any(re.search(pattern, "/" + path_lower) for pattern in job_path_patterns):
+        # Ashby and Lever job URLs can be /company/<opaque-id> or /company/<slug>.
+        if ats_name not in {"Ashby", "Lever"} or len(path.split("/")) < 2:
+            return None
+
+    country = classify_country(location=location, country_code=country_hint)
+    if country != "India":
+        return None
+
+    workplace = explicit_workplace
+    if workplace not in {"remote", "hybrid"}:
+        workplace = classify_workplace(location=location)
+    if workplace not in {"remote", "hybrid"}:
+        return None
+
+    # Require the location field itself to carry the work-mode signal. Do not
+    # infer remote/hybrid from the title or broad description text.
+    if explicit_workplace not in {"remote", "hybrid"} and not (
+        has_remote_word(location) or has_hybrid_word(location)
+    ):
+        return None
+
+    company = clean_text(raw_job.get("company")) or _guess_company_from_url(url)
+    job_id = path.rstrip("/").split("/")[-1]
+    if not job_id:
+        job_id = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+
+    return {
+        "company": company,
+        "title": title,
+        "location": location,
+        "country": "India",
+        "posted_date": clean_text(raw_job.get("posted")),
+        "job_url": url,
+        "job_id": job_id,
+        "ats": ats_name,
+    }
+
+
+def verified_india_ats_jobs(discovered_jobs):
+    """Return only high-confidence direct India ATS vacancies for job tabs."""
+    promoted = []
+    seen = set()
+    for raw_job in discovered_jobs:
+        job = _verified_india_ats_job_from_discovery(raw_job)
+        if not job:
+            continue
+        key = normalize_url(job["job_url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        promoted.append(job)
+    print(
+        f"  Verified India ATS vacancies eligible for existing tabs: "
+        f"{len(promoted)}"
+    )
+    return promoted
+
 
 
 # ============================================================
@@ -4873,27 +5042,29 @@ def main():
     )
 
     # --------------------------------------------------------
-    # SAVE
+    # INDIA SEARCH / API DISCOVERY
     # --------------------------------------------------------
 
-    print(
-        "\nSTEP 5 — Updating Google Sheets"
-    )
-
-    added = save_jobs(
-        spreadsheet,
-        jobs,
-    )
-
-    # --------------------------------------------------------
-    # INDIA API DISCOVERY (separate sheet; USA discovery disabled)
-    # --------------------------------------------------------
-
-    print("\nSTEP 6 — India API discovery")
+    print("\\nSTEP 5 — India Google/search API discovery")
     api_discovery_jobs = discover_india_api_jobs()
     india_discovery_added = save_india_discovery(
         spreadsheet,
         api_discovery_jobs,
+    )
+
+    # Promote only verified direct ATS vacancy URLs with explicit India
+    # location and explicit Remote/Hybrid evidence into the existing tabs.
+    # Generic career pages and ambiguous leads stay in India Discovery.
+    promoted_ats_jobs = verified_india_ats_jobs(api_discovery_jobs)
+    combined_jobs = deduplicate_jobs(jobs + promoted_ats_jobs)
+
+    # SAVE
+    # --------------------------------------------------------
+
+    print("\\nSTEP 6 — Updating Google Sheets (existing tabs preserved)")
+    added = save_jobs(
+        spreadsheet,
+        combined_jobs,
     )
 
     # --------------------------------------------------------
