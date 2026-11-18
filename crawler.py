@@ -87,6 +87,7 @@ MAX_JOB_AGE_DAYS = 14
 # Board discovery refresh interval for re-validating existing boards.
 # Internet Archive discovery runs daily; the existing Boards sheet
 # persists the validated ATS board registry between GitHub Actions runs.
+BOARD_CACHE_DAYS = 7  # Revalidate cached ATS boards every 7 days.
 
 # 0 = crawl every cached live board.
 MAX_BOARDS_PER_RUN = 0
