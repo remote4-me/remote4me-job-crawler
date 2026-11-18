@@ -60,6 +60,19 @@ from google.oauth2.service_account import Credentials
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
 
+# Optional discovery API keys. Missing keys are skipped safely.
+JSEARCH_API_KEY = os.environ.get("JSEARCH_API_KEY", "")
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+EXA_API_KEY = os.environ.get("EXA_API_KEY", "")
+SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY", "")
+FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY", "")
+JINA_API_KEY = os.environ.get("JINA_API_KEY", "")
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
+SEARLO_API_KEY = os.environ.get("SEARLO_API_KEY", "")
+
+API_RESULTS_PER_PROVIDER = 8
+MAX_JINA_ENRICHMENTS_PER_RUN = 2
+
 # Higher concurrency reduces the ~20 minute runtime seen with
 # thousands of boards. 16 is a compromise between speed and
 # public-API friendliness.
@@ -72,9 +85,8 @@ CONCURRENCY = 16
 MAX_JOB_AGE_DAYS = 14
 
 # Board discovery refresh interval for re-validating existing boards.
-# Internet Archive discovery itself runs EVERY day.
-# The Boards sheet persists between GitHub Actions runs.
-BOARD_CACHE_DAYS = 7
+# Internet Archive discovery runs daily; the existing Boards sheet
+# persists the validated ATS board registry between GitHub Actions runs.
 
 # 0 = crawl every cached live board.
 MAX_BOARDS_PER_RUN = 0
@@ -97,6 +109,8 @@ OUTPUT_TABS = {
     ("India", "hybrid"): "Hybrid India",
     ("USA", "hybrid"): "Hybrid USA",
 }
+
+INDIA_DISCOVERY_TAB = "India Discovery"
 
 SMART_RETRY_STATUS_CODES = {
     408,
@@ -639,6 +653,51 @@ TARGET_TITLE_PATTERNS = [
     r"\bcontact centre specialist\b", r"\bcall center support\b",
     r"\bcall centre support\b", r"\btechnical support operations\b",
     r"\bsoftware customer support\b", r"\bsaas customer support\b",
+
+    # BPO / contact-centre / process operations
+    r"\bbpo team leader\b",
+    r"\bbpo team lead\b",
+    r"\bteam leader\b",
+    r"\bteam lead\b",
+    r"\bsubject matter expert\b",
+    r"\bsme\b",
+    r"\bquality analyst\b",
+    r"\bquality assurance analyst\b",
+    r"\bquality coach\b",
+    r"\bquality specialist\b",
+    r"\bprocess trainer\b",
+    r"\bcustomer service trainer\b",
+    r"\bcustomer support trainer\b",
+    r"\bcall center trainer\b",
+    r"\bcall centre trainer\b",
+    r"\bcontact center trainer\b",
+    r"\bcontact centre trainer\b",
+    r"\bprocess associate\b",
+    r"\bprocess executive\b",
+    r"\bprocess specialist\b",
+    r"\bprocess expert\b",
+    r"\bbpo operations\b",
+    r"\bcontact center operations\b",
+    r"\bcontact centre operations\b",
+    r"\bcall center operations\b",
+    r"\bcall centre operations\b",
+    r"\boperations team leader\b",
+    r"\boperations team lead\b",
+    r"\bcustomer service team leader\b",
+    r"\bcustomer support team leader\b",
+    r"\bcustomer experience team leader\b",
+    r"\bworkforce management analyst\b",
+    r"\bworkforce management specialist\b",
+    r"\bwfm analyst\b",
+    r"\bworkforce analyst\b",
+    r"\bworkforce manager\b",
+    r"\bcontact center quality analyst\b",
+    r"\bcontact centre quality analyst\b",
+    r"\bcall center quality analyst\b",
+    r"\bcall centre quality analyst\b",
+    r"\bcustomer service quality analyst\b",
+    r"\bcustomer support quality analyst\b",
+
 ]
 
 
@@ -1158,6 +1217,424 @@ def request_json(
             return None
 
     return None
+
+
+
+# ============================================================
+# INDIA API DISCOVERY
+# ============================================================
+
+INDIA_DISCOVERY_HEADERS = [
+    "Added Date", "Company", "Job Title", "Location", "Country",
+    "Workplace", "Posted Date", "Job Link", "Source API",
+    "Search Query", "Snippet / Description", "Review Status",
+]
+
+# One rotating search query per provider per daily run. The query bank covers
+# BPO leadership, SMEs, quality, training, process and support roles.
+INDIA_DISCOVERY_QUERIES = [
+    '"customer support" jobs India remote hybrid',
+    '"technical support" OR "product support" jobs India',
+    '"BPO team leader" OR "customer service team leader" India jobs',
+    '"SME" OR "subject matter expert" BPO customer support India jobs',
+    '"quality analyst" OR "quality coach" contact center India jobs',
+    '"process trainer" OR "customer service trainer" India BPO jobs',
+    '"process associate" OR "process executive" customer service India jobs',
+    '"chat support" OR "email support" jobs India remote hybrid',
+    '"customer success" OR "customer experience" jobs India remote hybrid',
+    '"contact center" OR "call center" operations jobs India',
+    '"workforce management" OR "WFM analyst" BPO India jobs',
+    '"customer service" OR "customer care" jobs India hybrid remote',
+    '"escalation specialist" OR "support operations" India jobs',
+    '"technical support engineer" OR "helpdesk" India jobs remote hybrid',
+]
+
+INDIA_JOB_URL_HINTS = re.compile(
+    r"(?:/jobs?/|/careers?/|/career/|/positions?/|/openings?/|/vacanc(?:y|ies)/|"
+    r"/apply(?:/|$)|greenhouse\.io|ashbyhq\.com|jobs\.lever\.co|"
+    r"apply\.workable\.com|myworkdayjobs\.com|smartrecruiters\.com|"
+    r"recruitee\.com|personio\.|teamtailor\.com|breezy\.hr)",
+    re.IGNORECASE,
+)
+INDIA_ONSITE_HINTS = re.compile(
+    r"\b(?:on[\s-]?site|onsite|work from office|office[\s-]?based|"
+    r"in[\s-]?office|work at office)\b",
+    re.IGNORECASE,
+)
+
+
+def _api_json(method, url, *, headers=None, params=None, payload=None, timeout=35):
+    """Isolated API request. A provider failure never stops the main crawler."""
+    try:
+        if method.upper() == "POST":
+            response = SESSION.post(
+                url, headers=headers, params=params, json=payload, timeout=timeout
+            )
+        else:
+            response = SESSION.get(
+                url, headers=headers, params=params, timeout=timeout
+            )
+        if response.status_code != 200:
+            print(f"  API returned HTTP {response.status_code}: {url}")
+            return None
+        return response.json()
+    except (requests.RequestException, ValueError) as exc:
+        print(f"  API request failed ({url}): {exc}")
+        return None
+
+
+def _rotating_india_query(provider_offset=0):
+    day_number = datetime.now(timezone.utc).timetuple().tm_yday
+    index = (day_number + provider_offset) % len(INDIA_DISCOVERY_QUERIES)
+    return INDIA_DISCOVERY_QUERIES[index]
+
+
+def _result_list(data, provider):
+    if not isinstance(data, dict):
+        return []
+    if provider == "tavily":
+        return data.get("results") or []
+    if provider == "exa":
+        return data.get("results") or []
+    if provider == "serpapi":
+        return data.get("organic_results") or []
+    if provider == "firecrawl":
+        body = data.get("data", data)
+        if isinstance(body, dict):
+            return body.get("web") or body.get("results") or body.get("data") or []
+        return body if isinstance(body, list) else []
+    if provider == "serper":
+        return data.get("organic") or []
+    if provider == "searlo":
+        return data.get("organic") or data.get("results") or []
+    return []
+
+
+def _search_result_fields(item):
+    title = clean_text(item.get("title") or item.get("name") or "")
+    url = clean_text(item.get("url") or item.get("link") or item.get("href") or "")
+    highlights = item.get("highlights") or []
+    if isinstance(highlights, list):
+        highlights = " ".join(str(x) for x in highlights)
+    snippet = clean_text(
+        item.get("content") or item.get("snippet") or item.get("description")
+        or item.get("text") or item.get("summary") or highlights
+    )
+    posted = clean_text(
+        item.get("published_date") or item.get("publishedDate")
+        or item.get("date") or item.get("datePublished") or ""
+    )
+    return title, url, snippet, posted
+
+
+def _guess_company_from_url(url):
+    try:
+        host = urlparse(url).netloc.lower().split(":")[0].removeprefix("www.")
+        ats_hosts = (
+            "boards.greenhouse.io", "job-boards.greenhouse.io",
+            "jobs.ashbyhq.com", "jobs.lever.co", "jobs.eu.lever.co",
+            "apply.workable.com", "myworkdayjobs.com",
+            "jobs.smartrecruiters.com",
+        )
+        if any(host.endswith(x) for x in ats_hosts):
+            return ""
+        parts = host.split(".")
+        generic_subdomains = {
+            "careers", "career", "jobs", "job", "apply", "hiring",
+            "talent", "recruitment", "recruiting", "work", "people",
+        }
+        while len(parts) > 2 and parts[0] in generic_subdomains:
+            parts.pop(0)
+        first = parts[0]
+        if first in generic_subdomains and len(parts) > 1:
+            first = parts[1]
+        return humanize_company_slug(first) if first else ""
+    except Exception:
+        return ""
+
+
+def _jsearch_jobs(query):
+    if not JSEARCH_API_KEY:
+        print("  JSearch: API key not configured; skipped")
+        return []
+    data = _api_json(
+        "GET", "https://jsearch.p.rapidapi.com/search",
+        headers={
+            "X-RapidAPI-Key": JSEARCH_API_KEY,
+            "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
+        },
+        params={
+            "query": f"{query} in India", "country": "in",
+            "date_posted": "week", "num_pages": "1",
+        },
+    )
+    if not isinstance(data, dict):
+        return []
+    output = []
+    for item in data.get("data") or []:
+        parts = [item.get("job_city"), item.get("job_state"), item.get("job_country")]
+        location = ", ".join(clean_text(x) for x in parts if clean_text(x))
+        if item.get("job_is_remote"):
+            location = f"Remote - {location}".strip(" -")
+        output.append({
+            "title": item.get("job_title", ""),
+            "url": item.get("job_apply_link") or item.get("job_google_link") or "",
+            "company": item.get("employer_name", ""),
+            "location": location,
+            "country": item.get("job_country", ""),
+            "workplace": "remote" if item.get("job_is_remote") else "",
+            "posted": item.get("job_posted_at_datetime_utc", ""),
+            "snippet": item.get("job_description", ""),
+            "source": "JSearch",
+            "query": query,
+        })
+    print(f"  JSearch: {len(output)} job records")
+    return output
+
+
+def _search_provider_results():
+    collected = []
+    providers = [
+        ("Tavily", TAVILY_API_KEY),
+        ("Exa", EXA_API_KEY),
+        ("SerpApi", SERPAPI_API_KEY),
+        ("Firecrawl", FIRECRAWL_API_KEY),
+        ("Serper", SERPER_API_KEY),
+        ("Searlo", SEARLO_API_KEY),
+    ]
+    for offset, (provider, key) in enumerate(providers, start=1):
+        if not key:
+            print(f"  {provider}: API key not configured; skipped")
+            continue
+        query = _rotating_india_query(offset)
+        data = None
+
+        if provider == "Tavily":
+            data = _api_json(
+                "POST", "https://api.tavily.com/search",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                payload={
+                    "query": query, "search_depth": "basic",
+                    "max_results": API_RESULTS_PER_PROVIDER,
+                    "topic": "general", "include_answer": False,
+                    "include_raw_content": False, "country": "india",
+                },
+            )
+        elif provider == "Exa":
+            data = _api_json(
+                "POST", "https://api.exa.ai/search",
+                headers={"x-api-key": key, "Content-Type": "application/json"},
+                payload={
+                    "query": query, "type": "auto",
+                    "numResults": API_RESULTS_PER_PROVIDER,
+                    "contents": {"highlights": {"maxCharacters": 500}},
+                },
+            )
+        elif provider == "SerpApi":
+            data = _api_json(
+                "GET", "https://serpapi.com/search.json",
+                params={
+                    "engine": "google", "q": query, "api_key": key,
+                    "gl": "in", "hl": "en", "num": API_RESULTS_PER_PROVIDER,
+                },
+            )
+        elif provider == "Firecrawl":
+            data = _api_json(
+                "POST", "https://api.firecrawl.dev/v2/search",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                payload={
+                    "query": query, "limit": API_RESULTS_PER_PROVIDER,
+                    "sources": [{"type": "web"}], "country": "IN",
+                    "location": "India",
+                },
+            )
+        elif provider == "Serper":
+            data = _api_json(
+                "POST", "https://google.serper.dev/search",
+                headers={"X-API-KEY": key, "Content-Type": "application/json"},
+                payload={"q": query, "gl": "in", "hl": "en", "num": API_RESULTS_PER_PROVIDER},
+            )
+        elif provider == "Searlo":
+            data = _api_json(
+                "GET", "https://api.searlo.tech/api/v1/search/web",
+                headers={"x-api-key": key},
+                params={"q": query, "limit": API_RESULTS_PER_PROVIDER, "gl": "in", "hl": "en"},
+            )
+
+        results = _result_list(data, provider.lower()) if data else []
+        print(f"  {provider}: {len(results)} search results")
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            title, url, snippet, posted = _search_result_fields(item)
+            if not title or not url:
+                continue
+            collected.append({
+                "title": title, "url": url,
+                "company": _guess_company_from_url(url),
+                "location": "", "country": "", "workplace": "",
+                "posted": posted, "snippet": snippet,
+                "source": provider, "query": query,
+            })
+    return collected
+
+
+def _jina_read_page(url):
+    if not JINA_API_KEY or not url:
+        return ""
+    try:
+        response = SESSION.get(
+            f"https://r.jina.ai/{url}",
+            headers={
+                "Authorization": f"Bearer {JINA_API_KEY}",
+                "X-Respond-With": "text",
+            },
+            timeout=35,
+        )
+        if response.status_code == 200:
+            return clean_text(response.text)[:6000]
+        print(f"  Jina Reader returned HTTP {response.status_code}")
+    except requests.RequestException as exc:
+        print(f"  Jina Reader failed: {exc}")
+    return ""
+
+
+def discover_india_api_jobs():
+    """Collect India job leads from APIs only; USA API discovery is disabled."""
+    query = _rotating_india_query(0)
+    jobs = _jsearch_jobs(query)
+    jobs.extend(_search_provider_results())
+
+    # Jina Reader is used sparingly to enrich up to two thin job-page snippets.
+    enriched = 0
+    for job in jobs:
+        if enriched >= MAX_JINA_ENRICHMENTS_PER_RUN:
+            break
+        if len(clean_text(job.get("snippet"))) >= 100:
+            continue
+        if not INDIA_JOB_URL_HINTS.search(job.get("url", "")):
+            continue
+        page_text = _jina_read_page(job.get("url", ""))
+        if page_text:
+            job["snippet"] = page_text[:6000]
+            enriched += 1
+    print(f"  Jina Reader: enriched {enriched} candidate pages")
+    return jobs
+
+
+def _normalize_india_discovery_job(job):
+    title = clean_text(job.get("title"))
+    url = normalize_url(job.get("url") or job.get("job_url") or "")
+    snippet = clean_text(job.get("snippet") or job.get("description") or "")
+    location = clean_text(job.get("location"))
+    country_hint = clean_text(job.get("country"))
+    source_text = " ".join([title, location, snippet[:2500], url, country_hint])
+
+    if not title_is_relevant(title):
+        return None
+    if not url.startswith(("http://", "https://")):
+        return None
+    if not INDIA_JOB_URL_HINTS.search(url):
+        return None
+
+    country = classify_country(
+        location=location or source_text,
+        country_code=country_hint,
+        description=snippet,
+    )
+    if country != "India":
+        return None
+
+    workplace = clean_text(job.get("workplace")).lower()
+    workplace_text = " ".join([location, title, snippet[:1200]])
+    if workplace not in {"remote", "hybrid"}:
+        if has_hybrid_word(workplace_text):
+            workplace = "hybrid"
+        elif has_remote_word(workplace_text):
+            workplace = "remote"
+        elif INDIA_ONSITE_HINTS.search(workplace_text):
+            workplace = "onsite"
+        else:
+            workplace = "Needs review"
+
+    # Explicitly on-site roles are not part of Remote4.me's India target.
+    if workplace == "onsite":
+        return None
+
+    return {
+        "added_date": datetime.now(timezone.utc).date().isoformat(),
+        "company": clean_text(job.get("company")) or _guess_company_from_url(url),
+        "title": title,
+        "location": location or "India (location to verify)",
+        "country": "India",
+        "workplace": workplace,
+        "posted": clean_text(job.get("posted")),
+        "url": url,
+        "source": clean_text(job.get("source")),
+        "query": clean_text(job.get("query")),
+        "snippet": snippet[:4000],
+        "status": "Needs manual review",
+    }
+
+
+def save_india_discovery(spreadsheet, discovered_jobs):
+    """Append unique India API leads without creating or populating a USA tab."""
+    india_sheet = get_or_create_worksheet(
+        spreadsheet, INDIA_DISCOVERY_TAB, rows=5000,
+        cols=len(INDIA_DISCOVERY_HEADERS),
+    )
+    existing = india_sheet.get_all_values()
+    if not existing:
+        india_sheet.update("A1", [INDIA_DISCOVERY_HEADERS], value_input_option="RAW")
+        existing = [INDIA_DISCOVERY_HEADERS]
+    elif [clean_text(x) for x in existing[0]] != INDIA_DISCOVERY_HEADERS:
+        print("India Discovery has a custom header; preserving it and skipping API append.")
+        return 0
+
+    existing_urls = set()
+    existing_fallbacks = set()
+    for row in existing[1:]:
+        if len(row) > 7 and row[7]:
+            existing_urls.add(normalize_url(row[7]))
+        if len(row) > 3:
+            existing_fallbacks.add((
+                clean_text(row[1]).lower(),
+                clean_text(row[2]).lower(),
+                clean_text(row[3]).lower(),
+            ))
+
+    new_rows = []
+    run_seen_urls = set()
+    run_seen_fallbacks = set()
+    for raw_job in discovered_jobs:
+        job = _normalize_india_discovery_job(raw_job)
+        if not job:
+            continue
+        url = normalize_url(job["url"])
+        fallback = (
+            clean_text(job["company"]).lower(),
+            clean_text(job["title"]).lower(),
+            clean_text(job["location"]).lower(),
+        )
+        if (
+            url in existing_urls or url in run_seen_urls
+            or fallback in existing_fallbacks or fallback in run_seen_fallbacks
+        ):
+            continue
+        run_seen_urls.add(url)
+        run_seen_fallbacks.add(fallback)
+        new_rows.append([
+            job["added_date"], job["company"], job["title"],
+            job["location"], job["country"], job["workplace"],
+            job["posted"], job["url"], job["source"], job["query"],
+            job["snippet"], job["status"],
+        ])
+
+    if new_rows:
+        india_sheet.append_rows(new_rows, value_input_option="RAW")
+
+    print(f"India Discovery: added {len(new_rows)} new leads. USA API discovery is disabled.")
+    return len(new_rows)
 
 
 # ============================================================
@@ -4019,6 +4496,9 @@ def main():
         "  Output tabs: Remote India, Remote USA, Hybrid India, Hybrid USA"
     )
     print(
+        "  New API discovery output: India Discovery only (India Remote + Hybrid combined; USA API discovery disabled)"
+    )
+    print(
         "  Excluded companies: aogarciaagency"
     )
 
@@ -4027,10 +4507,6 @@ def main():
         f"{MAX_JOB_AGE_DAYS} days (deduplicated against existing Jobs)"
     )
 
-    print(
-        f"Board cache: "
-        f"{BOARD_CACHE_DAYS} days"
-    )
 
     # --------------------------------------------------------
     # GOOGLE SHEETS
@@ -4047,7 +4523,7 @@ def main():
     # --------------------------------------------------------
 
     print(
-        "\nSTEP 2 — Loading/discovering ATS boards"
+        "\nSTEP 2 — Discovering ATS boards (no Boards sheet)"
     )
 
     boards = discover_or_load_boards(
@@ -4072,9 +4548,8 @@ def main():
 
     if total_boards == 0:
         print(
-            "\nNo live boards available."
+            "\nNo live ATS boards available. Continuing with API discovery."
         )
-        return
 
     # --------------------------------------------------------
     # CRAWL
@@ -4084,9 +4559,7 @@ def main():
         "\nSTEP 3 — Crawling jobs"
     )
 
-    jobs = crawl_boards(
-        boards
-    )
+    jobs = crawl_boards(boards) if total_boards else []
 
     print(
         f"\nMatching jobs before "
@@ -4125,6 +4598,17 @@ def main():
     )
 
     # --------------------------------------------------------
+    # INDIA API DISCOVERY (separate sheet; USA discovery disabled)
+    # --------------------------------------------------------
+
+    print("\nSTEP 6 — India API discovery")
+    api_discovery_jobs = discover_india_api_jobs()
+    india_discovery_added = save_india_discovery(
+        spreadsheet,
+        api_discovery_jobs,
+    )
+
+    # --------------------------------------------------------
     # FINISHED
     # --------------------------------------------------------
 
@@ -4143,7 +4627,8 @@ def main():
         "CRAWLER FINISHED SUCCESSFULLY"
     )
     print(
-        f"New jobs added: {added}"
+        f"New ATS jobs added: {added}\n"
+        f"New India API discovery leads: {india_discovery_added}"
     )
     print(
         f"Runtime: {duration:.1f} seconds"
