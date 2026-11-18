@@ -1630,7 +1630,16 @@ def _normalize_india_discovery_job(job):
         return None
     if not url.startswith(("http://", "https://")):
         return None
-    if not INDIA_JOB_URL_HINTS.search(url):
+    # Search APIs return ordinary employer career pages as well as ATS URLs.
+    # Accept any real HTTP(S) result URL; exclude search engines/social/profile
+    # pages, then rely on title relevance and India-targeted query context.
+    host = (urlparse(url).netloc or "").lower().removeprefix("www.")
+    blocked_hosts = (
+        "google.com", "bing.com", "duckduckgo.com", "yahoo.com",
+        "facebook.com", "instagram.com", "linkedin.com", "youtube.com",
+        "x.com", "twitter.com", "reddit.com",
+    )
+    if not host or any(host == h or host.endswith("." + h) for h in blocked_hosts):
         return None
 
     country = classify_country(
@@ -1638,8 +1647,20 @@ def _normalize_india_discovery_job(job):
         country_code=country_hint,
         description=snippet,
     )
-    if country != "India":
+    # These API calls are explicitly issued with India-targeted queries and
+    # country=IN/gl=in where supported. If the result has no location metadata,
+    # keep it as an India lead but clearly mark it for manual location review.
+    query_text = clean_text(job.get("query")).lower()
+    inferred_india_from_query = (
+        country == "" and bool(re.search(r"\bindia\b", query_text))
+        and clean_text(job.get("source")) in {
+            "Tavily", "Exa", "SerpApi", "Firecrawl", "Serper", "Searlo", "JSearch"
+        }
+    )
+    if country != "India" and not inferred_india_from_query:
         return None
+    if inferred_india_from_query:
+        country = "India"
 
     workplace = clean_text(job.get("workplace")).lower()
     workplace_text = " ".join([location, title, snippet[:1200]])
@@ -1669,34 +1690,74 @@ def _normalize_india_discovery_job(job):
         "source": clean_text(job.get("source")),
         "query": clean_text(job.get("query")),
         "snippet": snippet[:4000],
-        "status": "Needs manual review",
+        "status": (
+            "Verify India location and work mode"
+            if inferred_india_from_query or workplace == "Needs review"
+            else "Needs manual review"
+        ),
     }
 
 
 def save_india_discovery(spreadsheet, discovered_jobs):
-    """Append unique India API leads without creating or populating a USA tab."""
+    """Append unique India API leads while preserving existing custom headers."""
     india_sheet = get_or_create_worksheet(
         spreadsheet, INDIA_DISCOVERY_TAB, rows=5000,
-        cols=len(INDIA_DISCOVERY_HEADERS),
+        cols=max(len(INDIA_DISCOVERY_HEADERS), 20),
     )
     existing = india_sheet.get_all_values()
     if not existing:
-        india_sheet.update("A1", [INDIA_DISCOVERY_HEADERS], value_input_option="RAW")
+        india_sheet.update(
+            range_name="A1",
+            values=[INDIA_DISCOVERY_HEADERS],
+            value_input_option="RAW",
+        )
         existing = [INDIA_DISCOVERY_HEADERS]
-    elif [clean_text(x) for x in existing[0]] != INDIA_DISCOVERY_HEADERS:
-        print("India Discovery has a custom header; preserving it and skipping API append.")
+
+    header = [clean_text(x).strip().lower() for x in existing[0]]
+    normal = [re.sub(r"[^a-z0-9]+", "", x) for x in header]
+    aliases = {
+        "added_date": {"addeddate", "dateadded", "discovereddate", "datefound"},
+        "company": {"company", "companyname", "employer", "employername"},
+        "title": {"jobtitle", "title", "position", "role"},
+        "location": {"location", "joblocation", "city"},
+        "country": {"country", "jobcountry"},
+        "workplace": {"workplace", "workmode", "worktype", "workarrangement", "arrangement"},
+        "posted": {"posteddate", "dateposted", "jobposted", "posted"},
+        "url": {"joblink", "applylink", "applicationlink", "url", "link", "joburl"},
+        "source": {"sourceapi", "source", "provider", "apisource"},
+        "query": {"searchquery", "query", "keyword"},
+        "snippet": {"snippetdescription", "description", "snippet", "jobdescription"},
+        "status": {"reviewstatus", "status", "verificationstatus"},
+    }
+    field_indexes = {}
+    for field, names in aliases.items():
+        for idx, header_name in enumerate(normal):
+            if header_name in names:
+                field_indexes[field] = idx
+                break
+
+    if "url" not in field_indexes or "title" not in field_indexes:
+        print(
+            "India Discovery header needs a Job Title/Title and Job Link/URL column; "
+            "preserving header and skipping append for safety."
+        )
+        print("  Detected headers: " + " | ".join(existing[0]))
         return 0
 
     existing_urls = set()
     existing_fallbacks = set()
     for row in existing[1:]:
-        if len(row) > 7 and row[7]:
-            existing_urls.add(normalize_url(row[7]))
-        if len(row) > 3:
+        url_idx = field_indexes["url"]
+        if len(row) > url_idx and row[url_idx]:
+            existing_urls.add(normalize_url(row[url_idx]))
+        title_idx = field_indexes["title"]
+        company_idx = field_indexes.get("company")
+        location_idx = field_indexes.get("location")
+        if len(row) > title_idx:
             existing_fallbacks.add((
-                clean_text(row[1]).lower(),
-                clean_text(row[2]).lower(),
-                clean_text(row[3]).lower(),
+                clean_text(row[company_idx]).lower() if company_idx is not None and len(row) > company_idx else "",
+                clean_text(row[title_idx]).lower(),
+                clean_text(row[location_idx]).lower() if location_idx is not None and len(row) > location_idx else "",
             ))
 
     new_rows = []
@@ -1712,24 +1773,31 @@ def save_india_discovery(spreadsheet, discovered_jobs):
             clean_text(job["title"]).lower(),
             clean_text(job["location"]).lower(),
         )
-        if (
-            url in existing_urls or url in run_seen_urls
-            or fallback in existing_fallbacks or fallback in run_seen_fallbacks
-        ):
+        if url in existing_urls or url in run_seen_urls or fallback in existing_fallbacks or fallback in run_seen_fallbacks:
             continue
+        row = [""] * len(existing[0])
+        values = {
+            "added_date": job["added_date"], "company": job["company"],
+            "title": job["title"], "location": job["location"],
+            "country": job["country"], "workplace": job["workplace"],
+            "posted": job["posted"], "url": job["url"],
+            "source": job["source"], "query": job["query"],
+            "snippet": job["snippet"], "status": job["status"],
+        }
+        for field, value in values.items():
+            idx = field_indexes.get(field)
+            if idx is not None and idx < len(row):
+                row[idx] = value
+        new_rows.append(row)
         run_seen_urls.add(url)
         run_seen_fallbacks.add(fallback)
-        new_rows.append([
-            job["added_date"], job["company"], job["title"],
-            job["location"], job["country"], job["workplace"],
-            job["posted"], job["url"], job["source"], job["query"],
-            job["snippet"], job["status"],
-        ])
 
     if new_rows:
         india_sheet.append_rows(new_rows, value_input_option="RAW")
-
-    print(f"India Discovery: added {len(new_rows)} new leads. USA API discovery is disabled.")
+    print(
+        f"India Discovery: added {len(new_rows)} new leads from search/job APIs. "
+        "India Remote + Hybrid are combined; verify any marked leads manually."
+    )
     return len(new_rows)
 
 
