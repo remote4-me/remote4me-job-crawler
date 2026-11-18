@@ -13,7 +13,7 @@ from google.oauth2.service_account import Credentials
 
 
 # ============================================================
-# REMOTE4.ME JOB CRAWLER — QUALITY / DAILY VERSION
+# REMOTE4.ME JOB CRAWLER — EXPANDED INDIA DISCOVERY VERSION
 # ============================================================
 #
 # Scope:
@@ -95,7 +95,7 @@ MAX_BOARDS_PER_RUN = 0
 # the next discovery refresh. This avoids carrying dead boards.
 MAX_BOARD_FAILURES = 3
 
-USER_AGENT = "Remote4.me Job Crawler/3.2"
+USER_AGENT = "Remote4.me Job Crawler/3.3"
 
 # Companies that must never enter any output tab.
 # Match normalized company/board slugs and job URLs.
@@ -171,6 +171,23 @@ ATS_SOURCES = {
         "api": (
             "https://www.workable.com/"
             "api/accounts/{slug}"
+        ),
+    },
+
+    # SmartRecruiters public Posting API. Company identifiers are
+    # discovered from public jobs.smartrecruiters.com career URLs.
+    "smartrecruiters": {
+        "archive_domains": [
+            "jobs.smartrecruiters.com",
+            "careers.smartrecruiters.com",
+        ],
+        "api": (
+            "https://api.smartrecruiters.com/v1/companies/"
+            "{slug}/postings"
+        ),
+        "detail_api": (
+            "https://api.smartrecruiters.com/v1/companies/"
+            "{slug}/postings/{job_id}"
         ),
     },
 }
@@ -696,7 +713,56 @@ TARGET_TITLE_PATTERNS = [
     r"\bcall center quality analyst\b",
     r"\bcall centre quality analyst\b",
     r"\bcustomer service quality analyst\b",
+    r"\bcustomer service quality analyst\b",
     r"\bcustomer support quality analyst\b",
+
+    # BPO / contact-centre / voice and non-voice operations titles
+    r"\bbpo operations executive\b",
+    r"\bbpo operations specialist\b",
+    r"\bbpo operations manager\b",
+    r"\bprocess associate\b",
+    r"\bprocess executive\b",
+    r"\bprocess specialist\b",
+    r"\bprocess analyst\b",
+    r"\bprocess trainer\b",
+    r"\bprocess coach\b",
+    r"\bprocess lead\b",
+    r"\bprocess team leader\b",
+    r"\bteam leader\b",
+    r"\bteam lead\b",
+    r"\bfloor support\b",
+    r"\bfloor supervisor\b",
+    r"\bsubject matter expert\b",
+    r"\bsme\b",
+    r"\bquality analyst\b",
+    r"\bqa analyst\b",
+    r"\bquality assurance analyst\b",
+    r"\bquality coach\b",
+    r"\bquality evaluator\b",
+    r"\bquality specialist\b",
+    r"\bquality executive\b",
+    r"\bquality auditor\b",
+    r"\bquality lead\b",
+    r"\bquality team leader\b",
+    r"\bvoice process\b",
+    r"\bnon[ -]?voice process\b",
+    r"\binternational voice process\b",
+    r"\bdomestic voice process\b",
+    r"\bchat process\b",
+    r"\bemail process\b",
+    r"\bblended process\b",
+    r"\bcontact centre operations\b",
+    r"\bcontact center operations\b",
+    r"\bcall centre operations\b",
+    r"\bcall center operations\b",
+    r"\bservice delivery associate\b",
+    r"\bservice delivery specialist\b",
+    r"\bservice delivery manager\b",
+    r"\bworkforce management analyst\b",
+    r"\breal time analyst\b",
+    r"\brealtime analyst\b",
+    r"\brta\b",
+    r"\bscheduling analyst\b",
 
 ]
 
@@ -1233,8 +1299,8 @@ INDIA_DISCOVERY_HEADERS = [
 # One rotating search query per provider per daily run. The query bank covers
 # BPO leadership, SMEs, quality, training, process and support roles.
 INDIA_DISCOVERY_QUERIES = [
-    '"customer support" jobs India remote hybrid',
-    '"technical support" OR "product support" jobs India',
+    '"customer support" jobs India remote hybrid careers',
+    '"technical support" OR "product support" jobs India remote hybrid',
     '"BPO team leader" OR "customer service team leader" India jobs',
     '"SME" OR "subject matter expert" BPO customer support India jobs',
     '"quality analyst" OR "quality coach" contact center India jobs',
@@ -1247,13 +1313,33 @@ INDIA_DISCOVERY_QUERIES = [
     '"customer service" OR "customer care" jobs India hybrid remote',
     '"escalation specialist" OR "support operations" India jobs',
     '"technical support engineer" OR "helpdesk" India jobs remote hybrid',
+    '"voice process" OR "international voice process" India BPO jobs',
+    '"non voice process" OR "non-voice process" India customer support jobs',
+    '"blended process" OR "chat process" India BPO careers',
+    '"quality assurance" OR "QA analyst" customer support India BPO',
+    '"floor support" OR "floor supervisor" BPO India jobs',
+    '"process lead" OR "process team leader" India customer service jobs',
+    '"service delivery associate" OR "service delivery specialist" India support',
+    '"real time analyst" OR "RTA" contact center India jobs',
+    '"customer care executive" OR "customer service executive" India jobs',
+    '"client support" OR "merchant support" India remote hybrid jobs',
+    '"application support" OR "IT helpdesk" India remote hybrid careers',
+    '"desktop support" OR "L1 support" OR "L2 support" India jobs',
+    '"onboarding specialist" OR "implementation specialist" India jobs',
+    '"trust and safety" OR "content moderation" customer operations India jobs',
+    'site:jobs.smartrecruiters.com India support OR customer OR quality analyst',
+    'site:jobs.ashbyhq.com India support OR customer success OR product support',
+    'site:boards.greenhouse.io OR site:job-boards.greenhouse.io India support jobs',
+    'site:jobs.lever.co India customer support OR technical support OR BPO',
+    'site:apply.workable.com India customer support OR quality analyst OR team leader',
 ]
 
 INDIA_JOB_URL_HINTS = re.compile(
     r"(?:/jobs?/|/careers?/|/career/|/positions?/|/openings?/|/vacanc(?:y|ies)/|"
     r"/apply(?:/|$)|greenhouse\.io|ashbyhq\.com|jobs\.lever\.co|"
     r"apply\.workable\.com|myworkdayjobs\.com|smartrecruiters\.com|"
-    r"recruitee\.com|personio\.|teamtailor\.com|breezy\.hr)",
+    r"recruitee\.com|personio\.|teamtailor\.com|breezy\.hr|"
+    r"jobs\.smartrecruiters\.com|careers\.smartrecruiters\.com)",
     re.IGNORECASE,
 )
 INDIA_ONSITE_HINTS = re.compile(
@@ -1334,7 +1420,7 @@ def _guess_company_from_url(url):
             "boards.greenhouse.io", "job-boards.greenhouse.io",
             "jobs.ashbyhq.com", "jobs.lever.co", "jobs.eu.lever.co",
             "apply.workable.com", "myworkdayjobs.com",
-            "jobs.smartrecruiters.com",
+            "jobs.smartrecruiters.com", "careers.smartrecruiters.com",
         )
         if any(host.endswith(x) for x in ats_hosts):
             return ""
@@ -1504,6 +1590,15 @@ def discover_india_api_jobs():
     query = _rotating_india_query(0)
     jobs = _jsearch_jobs(query)
     jobs.extend(_search_provider_results())
+
+    # Provider mix is reported so API value can be compared in Actions logs.
+    source_counts = {}
+    for item in jobs:
+        source = clean_text(item.get("source") or "Unknown")
+        source_counts[source] = source_counts.get(source, 0) + 1
+    print("  Raw discovery by provider: " + ", ".join(
+        f"{name}={count}" for name, count in sorted(source_counts.items())
+    ))
 
     # Jina Reader is used sparingly to enrich up to two thin job-page snippets.
     enriched = 0
@@ -2603,6 +2698,19 @@ def validate_workable(
     return True
 
 
+def validate_smartrecruiters(slug):
+    url = ATS_SOURCES["smartrecruiters"]["api"].format(slug=quote(str(slug), safe=""))
+    data = request_json(url, timeout=25, params={"limit": 1, "offset": 0})
+    if not isinstance(data, dict) or not isinstance(data.get("content"), list):
+        return False
+    content = data.get("content") or []
+    if content:
+        company = (content[0].get("company") or {}).get("name")
+        if company:
+            DISCOVERED_COMPANY_NAMES[("smartrecruiters", slug)] = clean_text(company)
+    return True
+
+
 def validate_board(
     ats,
     slug,
@@ -2633,6 +2741,9 @@ def validate_board(
         return validate_workable(
             slug
         )
+
+    if ats == "smartrecruiters":
+        return validate_smartrecruiters(slug)
 
     return False
 
@@ -2766,6 +2877,9 @@ def ats_board_url(ats, slug):
 
     if ats == "workable":
         return f"https://apply.workable.com/{encoded}/"
+
+    if ats == "smartrecruiters":
+        return f"https://jobs.smartrecruiters.com/{encoded}"
 
     return ""
 
@@ -3871,11 +3985,116 @@ def fetch_workable(
     return results
 
 
+def fetch_smartrecruiters(slug):
+    """Fetch public SmartRecruiters postings for one company career board."""
+    base = ATS_SOURCES["smartrecruiters"]["api"].format(slug=quote(str(slug), safe=""))
+    results = []
+    offset = 0
+    page_size = 100
+    max_pages = 3  # cap requests per company per daily run
+
+    for _ in range(max_pages):
+        data = request_json(
+            base, timeout=30,
+            params={"limit": page_size, "offset": offset, "destination": "PUBLIC"},
+        )
+        if not isinstance(data, dict):
+            break
+        postings = data.get("content") or []
+        if not postings:
+            break
+
+        for posting in postings:
+            title = clean_text(posting.get("name"))
+            if not title_is_relevant(title):
+                continue
+
+            loc = posting.get("location") or {}
+            city = clean_text(loc.get("city"))
+            region = clean_text(loc.get("region"))
+            country_code = clean_text(loc.get("country"))
+            location = ", ".join(x for x in [city, region, country_code] if x)
+            if loc.get("remote") is True:
+                location = ("Remote - " + location).strip(" -")
+
+            posted = parse_date(posting.get("releasedDate"))
+            if not is_recent(posted):
+                continue
+
+            job_id = clean_text(posting.get("id") or posting.get("uuid"))
+            detail = {}
+            if job_id:
+                detail_url = ATS_SOURCES["smartrecruiters"]["detail_api"].format(
+                    slug=quote(str(slug), safe=""), job_id=quote(job_id, safe="")
+                )
+                detail = request_json(detail_url, timeout=25) or {}
+
+            # SmartRecruiters' list response exposes a remote flag, but does
+            # not consistently expose Hybrid. Use explicit hybrid wording
+            # from the public job description only when the structured flag
+            # has not already identified the role as Remote.
+            sections = detail.get("jobAd", {}).get("sections", {})
+            description_text = " ".join(
+                clean_text(section.get("text"))
+                for section in sections.values()
+                if isinstance(section, dict)
+            )
+            workplace = classify_workplace(
+                location=location,
+                remote_flag=loc.get("remote"),
+                structured_data=posting,
+            )
+            if workplace == "unknown" and re.search(
+                r"\bhybrid(?: work| working| schedule| model| role| arrangement)?\b|\bpartly remote\b",
+                description_text,
+                re.IGNORECASE,
+            ):
+                workplace = "hybrid"
+
+            country = classify_country(
+                location=location,
+                country_code=country_code,
+                description=description_text,
+                workplace=workplace,
+            )
+            if not location_is_allowed(country, workplace):
+                continue
+
+            apply_url = clean_text(
+                detail.get("applyUrl") or posting.get("applyUrl")
+                or detail.get("jobAd", {}).get("sections", {}).get("jobDescription", {}).get("url")
+            )
+            if not apply_url:
+                # SmartRecruiters public career-page URL fallback.
+                apply_url = f"https://jobs.smartrecruiters.com/{quote(str(slug), safe='')}/{quote(job_id, safe='')}"
+
+            results.append({
+                "ats": "smartrecruiters",
+                "company": clean_text((posting.get("company") or {}).get("name"))
+                           or DISCOVERED_COMPANY_NAMES.get(("smartrecruiters", slug), humanize_company_slug(slug)),
+                "job_id": job_id,
+                "title": title,
+                "location": location,
+                "country": country,
+                "workplace": workplace,
+                "posted_date": posted,
+                "job_url": apply_url,
+            })
+
+        total_found = data.get("totalFound")
+        offset += len(postings)
+        if len(postings) < page_size or (total_found is not None and offset >= int(total_found)):
+            break
+
+    return results
+
+
 FETCHERS = {
     "greenhouse": fetch_greenhouse,
     "ashby": fetch_ashby,
     "lever": fetch_lever,
     "workable": fetch_workable,
+    "smartrecruiters": fetch_smartrecruiters,
 }
 
 
@@ -4523,7 +4742,7 @@ def main():
     # --------------------------------------------------------
 
     print(
-        "\nSTEP 2 — Discovering ATS boards (no Boards sheet)"
+        "\nSTEP 2 — Discovering ATS boards (persistent Boards sheet)"
     )
 
     boards = discover_or_load_boards(
