@@ -4,6 +4,8 @@
 # It intentionally reads the existing Boards registry but never modifies it.
 
 import os
+from datetime import datetime, timedelta, timezone
+
 import crawler
 
 
@@ -40,8 +42,26 @@ def main():
         except Exception as exc:
             print(f"WARNING: Ashby board {slug} failed: {exc}")
 
-    jobs = crawler.deduplicate_jobs(jobs)
-    print(f"Unique Ashby jobs after deduplication: {len(jobs)}")
+    # Remote4Me's preferred freshness window is 7 days. The shared adapter
+    # already removes older postings at its configured limit; this stricter
+    # Ashby-only pass keeps the separate tabs aligned to the 7-day window.
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=7)
+    recent_jobs = []
+    for job in jobs:
+        posted = crawler.parse_date(job.get("posted_date", ""))
+        if not posted:
+            recent_jobs.append(job)  # Keep undated public listings for manual review.
+            continue
+        try:
+            posted_day = datetime.strptime(posted, "%Y-%m-%d").date()
+        except ValueError:
+            recent_jobs.append(job)
+            continue
+        if posted_day >= cutoff:
+            recent_jobs.append(job)
+
+    jobs = crawler.deduplicate_jobs(recent_jobs)
+    print(f"Unique Ashby jobs within the 7-day window: {len(jobs)}")
 
     # Keep output isolated from the existing Remote4Me master and country tabs.
     # append_new_jobs_to_worksheet uses job ID, direct URL and fallback keys.
