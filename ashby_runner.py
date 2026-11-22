@@ -4,7 +4,6 @@
 # It intentionally reads the existing Boards registry but never modifies it.
 
 import os
-import sys
 import crawler
 
 
