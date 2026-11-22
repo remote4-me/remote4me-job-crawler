@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
 
   schedule:
-    # 7:00 PM India Standard Time (IST)
-    # 19:00 IST = 13:30 UTC
-    - cron: "30 13 * * *"
+    # 5:00 PM India Standard Time (IST)
+    # 17:00 IST = 11:30 UTC
+    - cron: "30 11 * * *"
 
 permissions:
   contents: read
@@ -31,6 +31,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests gspread google-auth
 
+      - name: Check Python syntax
+        run: python -m py_compile crawler.py
+
       - name: Run Remote4.me crawler
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
@@ -51,4 +54,4 @@ jobs:
         if: success()
         run: |
           echo "Remote4.me crawler completed successfully."
-          echo "Scheduled time: 7:00 PM IST."
+          echo "Scheduled time: 5:00 PM IST."
