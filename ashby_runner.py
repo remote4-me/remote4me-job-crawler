@@ -33,14 +33,19 @@ def main():
         print("Add Ashby board slugs to ASHBY_SEED_SLUGS or the Boards tab.")
         return
 
-    jobs = []
-    for index, slug in enumerate(slugs, start=1):
-        try:
-            found = crawler.fetch_ashby(slug)
-            print(f"[{index}/{len(slugs)}] {slug}: {len(found)} eligible jobs")
-            jobs.extend(found)
-        except Exception as exc:
-            print(f"WARNING: Ashby board {slug} failed: {exc}")
+    # Use the same bounded thread pool as the main crawler rather than
+    # issuing hundreds of board requests sequentially.
+    company_by_slug = {
+        slug: (item.get("company") or crawler.humanize_company_slug(slug))
+        for (ats, slug), item in registry.items()
+        if ats == "ashby"
+    }
+    jobs = crawler.crawl_boards({"ashby": slugs})
+    for job in jobs:
+        slug = job.get("company", "")
+        job["company"] = company_by_slug.get(
+            slug, crawler.humanize_company_slug(slug)
+        )
 
     # Remote4Me's preferred freshness window is 7 days. The shared adapter
     # already removes older postings at its configured limit; this stricter
