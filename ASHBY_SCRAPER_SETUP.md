@@ -19,7 +19,7 @@ Only jobs classified as:
 - USA + Remote
 - USA + Hybrid
 
-are written. The existing crawler's job-age window and title relevance rules also apply. Each listing must have a direct job URL.
+are written. The existing crawler's support-title relevance rules apply. The Ashby-only output uses a 7-day posted-date window; listings without a posted date are retained for manual checking. Each listing must have a direct job URL.
 
 ## Google Sheets
 
