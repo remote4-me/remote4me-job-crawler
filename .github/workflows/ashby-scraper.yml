@@ -1,11 +1,13 @@
 name: Remote4Me Ashby Support Jobs
 
 on:
+  # Run automatically after the existing daily crawler finishes. This ensures
+  # its Boards registry has been refreshed before this Ashby-only pass starts.
+  workflow_run:
+    workflows: ["Remote4.me Job Crawler"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
-  schedule:
-    # Run after the existing 7:00 PM IST crawler has refreshed the Boards registry.
-    # 8:00 PM India Standard Time = 14:30 UTC.
-    - cron: "30 14 * * *"
 
 permissions:
   contents: read
@@ -16,6 +18,8 @@ concurrency:
 
 jobs:
   ashby:
+    # Do not run on a failed/cancelled parent crawl. Manual runs remain available.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -26,7 +30,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
 
       - name: Install dependencies
         run: |
@@ -40,4 +43,3 @@ jobs:
           ASHBY_SEED_SLUGS: ${{ vars.ASHBY_SEED_SLUGS }}
           PYTHONUNBUFFERED: "1"
         run: python ashby_runner.py
-
