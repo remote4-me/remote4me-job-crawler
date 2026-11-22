@@ -35,6 +35,12 @@ from google.oauth2.service_account import Credentials
 #   - Ashby
 #   - Lever
 #   - Workable
+#   - SmartRecruiters
+#   - Recruitee
+#   - Teamtailor
+#   - Pinpoint
+#   - Workday
+#   - Keka
 #
 # Design goals:
 #   - High relevance, low junk
@@ -191,6 +197,14 @@ ATS_SOURCES = {
             "{slug}/postings/{job_id}"
         ),
     },
+
+    # Subdomain-hosted public ATS boards, discovered through Common Crawl's
+    # wildcard index (company.provider.com rather than provider.com/company).
+    "recruitee": {"subdomain_domain": "recruitee.com"},
+    "teamtailor": {"subdomain_domain": "teamtailor.com"},
+    "pinpoint": {"subdomain_domain": "pinpointhq.com"},
+    "workday": {"subdomain_domain": "myworkdayjobs.com"},
+    "keka": {"subdomain_domain": "keka.com"},
 }
 
 
@@ -1235,6 +1249,14 @@ SESSION.headers.update({
     "User-Agent": USER_AGENT,
     "Accept": "application/json,text/plain,*/*",
 })
+
+
+def request_text(url, timeout=30):
+    try:
+        response = SESSION.get(url, headers={"Accept": "text/html,*/*"}, timeout=timeout)
+        return response.text if response.status_code == 200 else ""
+    except requests.RequestException:
+        return ""
 
 
 def request_json(
@@ -2768,6 +2790,90 @@ def discover_from_commoncrawl(domain):
     return candidates
 
 
+def discover_subdomain_boards_from_commoncrawl(ats, base_domain):
+    """
+    Enumerate ATS providers that host one company per subdomain.
+    Mirrors the original project's Common Crawl wildcard discovery:
+    Recruitee, Teamtailor, Pinpoint, Workday and Keka.
+    """
+    candidates = set()
+    reserved = {"www", "app", "api", "auth", "blog", "docs", "help",
+                "jobs", "status", "support"}
+    try:
+        info = SESSION.get("https://index.commoncrawl.org/collinfo.json", timeout=30)
+        if info.status_code != 200:
+            print(f"  Common Crawl index list returned {info.status_code}")
+            return candidates
+        collections = info.json() or []
+        if not collections:
+            return candidates
+        index_id = collections[0].get("id")
+        if not index_id:
+            return candidates
+        endpoint = f"https://index.commoncrawl.org/{index_id}-index"
+        params = {"url": f"*.{base_domain}", "output": "json",
+                  "fl": "url", "showNumPages": "true"}
+        response = SESSION.get(endpoint, params=params, timeout=60)
+        if response.status_code != 200:
+            print(f"  Common Crawl wildcard request returned {response.status_code} for {base_domain}")
+            return candidates
+        try:
+            page_count = int(response.json().get("pages", 1))
+        except Exception:
+            page_count = 1
+        for page in range(min(page_count, 10)):
+            try:
+                page_params = dict(params)
+                page_params.pop("showNumPages", None)
+                page_params["page"] = page
+                page_response = SESSION.get(endpoint, params=page_params, timeout=90)
+                if page_response.status_code != 200:
+                    print(f"  Common Crawl page {page + 1} failed for {base_domain}: HTTP {page_response.status_code}")
+                    continue
+                for line in page_response.text.splitlines():
+                    try:
+                        raw_url = json.loads(line).get("url", "")
+                        parsed = urlparse(raw_url)
+                        host = parsed.hostname.lower() if parsed.hostname else ""
+                        suffix = "." + base_domain
+                        if not host.endswith(suffix):
+                            continue
+                        labels = host[:-len(suffix)].split(".")
+                        slug = ""
+                        if ats == "workday":
+                            # tenant.wd5.myworkdayjobs.com/{locale}/{site}/...
+                            segments = [x for x in parsed.path.split("/") if x]
+                            site = segments[1] if segments and re.fullmatch(r"[a-z]{2}(-[a-z]{2})?", segments[0], re.I) and len(segments) > 1 else (segments[0] if segments else "")
+                            if len(labels) == 2 and re.fullmatch(r"wd\\d+", labels[1]) and site:
+                                slug = f"{labels[0]}/{labels[1]}/{site}"
+                        elif ats == "teamtailor" and len(labels) == 2 and labels[1] == "na":
+                            slug = ".".join(labels)
+                        elif len(labels) == 1 and labels[0] not in reserved:
+                            if ats != "keka" or parsed.path.lower().startswith("/careers"):
+                                slug = labels[0]
+                        if ats != "smartrecruiters":
+                            slug = slug.lower()
+                        if slug and is_valid_ats_slug(ats, slug):
+                            candidates.add(slug)
+                    except Exception:
+                        continue
+            except requests.RequestException as exc:
+                print(f"  Common Crawl page error for {base_domain}: {exc}")
+                continue
+    except Exception as exc:
+        print(f"  Common Crawl subdomain discovery failed for {base_domain}: {exc}")
+    return candidates
+
+
+def is_valid_ats_slug(ats, slug):
+    if ats == "workday":
+        parts = str(slug).split("/")
+        return len(parts) == 3 and all(re.fullmatch(r"[A-Za-z0-9_-]+", p or "") for p in parts)
+    if ats == "teamtailor":
+        return bool(re.fullmatch(r"[a-z0-9_-]+(?:\\.na)?", str(slug), re.I))
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]+", str(slug)))
+
+
 def discover_boards_for_ats(
     ats,
 ):
@@ -2776,6 +2882,15 @@ def discover_boards_for_ats(
     print(
         f"\nDiscovering {ats} boards..."
     )
+
+    subdomain_domain = ATS_SOURCES[ats].get("subdomain_domain")
+    if subdomain_domain:
+        found = discover_subdomain_boards_from_commoncrawl(ats, subdomain_domain)
+        print(f"  Common Crawl wildcard {subdomain_domain}: {len(found)} candidates")
+        for slug in found:
+            key = (ats, slug)
+            DISCOVERED_BOARD_URLS.setdefault(key, ats_board_url(ats, slug))
+        return found
 
     for domain in ATS_SOURCES[
         ats
@@ -2983,6 +3098,42 @@ def validate_board(
     if ats == "smartrecruiters":
         return validate_smartrecruiters(slug)
 
+    if ats == "recruitee":
+        data = request_json(f"https://{slug}.recruitee.com/api/offers/", timeout=25)
+        return isinstance(data, dict) and isinstance(data.get("offers"), list)
+
+    if ats == "teamtailor":
+        data = request_json(f"https://{slug}.teamtailor.com/jobs.json", timeout=25)
+        return isinstance(data, dict) and isinstance(data.get("items"), list)
+
+    if ats == "pinpoint":
+        data = request_json(f"https://{slug}.pinpointhq.com/postings.json", timeout=25)
+        return isinstance(data, dict) and isinstance(data.get("data"), list)
+
+    if ats == "workday":
+        parts = slug.split("/")
+        if len(parts) != 3:
+            return False
+        tenant, wd_host, site = parts
+        url = f"https://{tenant}.{wd_host}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs"
+        try:
+            response = SESSION.post(url, json={"appliedFacets": {}, "limit": 1, "offset": 0, "searchText": ""},
+                                    headers={"Content-Type": "application/json"}, timeout=25)
+            data = response.json() if response.status_code == 200 else {}
+            return isinstance(data.get("jobPostings"), list)
+        except Exception:
+            return False
+
+    if ats == "keka":
+        html = request_text(f"https://{slug}.keka.com/careers/", timeout=25)
+        if not html:
+            return False
+        match = re.search(r"/ats/documents/([0-9a-f-]{36})/", html, re.I)
+        if not match:
+            return False
+        data = request_json(f"https://{slug}.keka.com/careers/api/embedjobs/default/active/{match.group(1)}", timeout=25)
+        return isinstance(data, list)
+
     return False
 
 
@@ -3118,6 +3269,19 @@ def ats_board_url(ats, slug):
 
     if ats == "smartrecruiters":
         return f"https://jobs.smartrecruiters.com/{encoded}"
+
+    if ats == "recruitee":
+        return f"https://{slug}.recruitee.com"
+    if ats == "teamtailor":
+        return f"https://{slug}.teamtailor.com"
+    if ats == "pinpoint":
+        return f"https://{slug}.pinpointhq.com"
+    if ats == "workday":
+        parts = str(slug).split("/")
+        if len(parts) == 3:
+            return f"https://{parts[0]}.{parts[1]}.myworkdayjobs.com/{parts[2]}"
+    if ats == "keka":
+        return f"https://{slug}.keka.com/careers/"
 
     return ""
 
@@ -4327,12 +4491,180 @@ def fetch_smartrecruiters(slug):
     return results
 
 
+def fetch_recruitee(slug):
+    data = request_json(f"https://{slug}.recruitee.com/api/offers/", timeout=35)
+    offers = data.get("offers", []) if isinstance(data, dict) else []
+    results = []
+    for raw in offers:
+        if raw.get("status") and str(raw.get("status")).lower() != "published":
+            continue
+        title = clean_text(raw.get("title"))
+        if not title_is_relevant(title):
+            continue
+        loc = raw.get("location") or ""
+        if isinstance(loc, dict):
+            location = ", ".join(clean_text(loc.get(k)) for k in ("city", "region", "country") if clean_text(loc.get(k)))
+            country_code = clean_text(loc.get("country_code") or loc.get("countryCode"))
+        else:
+            location, country_code = clean_text(loc), ""
+        workplace = classify_workplace(location=location, remote_flag=raw.get("remote"), structured_data=raw)
+        country = classify_country(location=location, country_code=country_code, description=clean_text(raw.get("description")), workplace=workplace)
+        if not location_is_allowed(country, workplace):
+            continue
+        posted = parse_date(raw.get("published_at") or raw.get("created_at"))
+        if not is_recent(posted):
+            continue
+        link = clean_text(raw.get("careers_apply_url") or raw.get("careers_url"))
+        job_id = clean_text(raw.get("id"))
+        if link and job_id:
+            results.append({"ats":"recruitee","company":slug,"job_id":job_id,"title":title,"location":location,"country":country,"workplace":workplace,"posted_date":posted,"job_url":link})
+    return results
+
+
+def fetch_teamtailor(slug):
+    data = request_json(f"https://{slug}.teamtailor.com/jobs.json", timeout=35)
+    items = data.get("items", []) if isinstance(data, dict) else []
+    results = []
+    for raw in items:
+        jp = raw.get("_jobposting") or {}
+        title = clean_text(raw.get("title"))
+        if not title_is_relevant(title):
+            continue
+        places = jp.get("jobLocation") or []
+        if isinstance(places, dict):
+            places = [places]
+        location_parts = []
+        country_code = ""
+        for place in places:
+            address = (place or {}).get("address") or {}
+            location_parts.extend(clean_text(address.get(k)) for k in ("addressLocality","addressRegion","addressCountry") if clean_text(address.get(k)))
+            country_code = country_code or clean_text(address.get("addressCountry"))
+        location = ", ".join(dict.fromkeys(location_parts))
+        workplace = classify_workplace(location=location, workplace_type=jp.get("jobLocationType"), structured_data=jp)
+        if workplace == "unknown" and re.search(r"\\bremote\\b", title, re.I):
+            workplace = "remote"
+        country = classify_country(location=location, country_code=country_code, description=clean_text(raw.get("content_html") or jp.get("description")), workplace=workplace)
+        if not location_is_allowed(country, workplace):
+            continue
+        posted = parse_date(jp.get("datePosted") or raw.get("date_published"))
+        if not is_recent(posted):
+            continue
+        link = clean_text(raw.get("url"))
+        job_id = clean_text(raw.get("id"))
+        if link and job_id:
+            results.append({"ats":"teamtailor","company":slug.replace(".na",""),"job_id":job_id,"title":title,"location":location,"country":country,"workplace":workplace,"posted_date":posted,"job_url":link})
+    return results
+
+
+def fetch_pinpoint(slug):
+    data = request_json(f"https://{slug}.pinpointhq.com/postings.json", timeout=35)
+    postings = data.get("data", []) if isinstance(data, dict) else []
+    results = []
+    for raw in postings:
+        title = clean_text(raw.get("title"))
+        if not title_is_relevant(title):
+            continue
+        loc = raw.get("location") or {}
+        location = clean_text(loc.get("name") or loc.get("city"))
+        country_code = clean_text(loc.get("country_code") or loc.get("countryCode") or loc.get("country"))
+        workplace_type = raw.get("workplace_type_text") or raw.get("workplace_type")
+        workplace = classify_workplace(location=location, workplace_type=workplace_type, structured_data=raw)
+        country = classify_country(location=location, country_code=country_code, description=clean_text(raw.get("description")), workplace=workplace)
+        if not location_is_allowed(country, workplace):
+            continue
+        posted = parse_date(raw.get("published_at") or raw.get("created_at"))
+        if not is_recent(posted):
+            continue
+        link = clean_text(raw.get("url"))
+        job_id = clean_text(raw.get("id"))
+        if link and job_id:
+            results.append({"ats":"pinpoint","company":slug,"job_id":job_id,"title":title,"location":location,"country":country,"workplace":workplace,"posted_date":posted,"job_url":link})
+    return results
+
+
+def fetch_workday(slug):
+    parts = slug.split("/")
+    if len(parts) != 3:
+        return []
+    tenant, wd_host, site = parts
+    base = f"https://{tenant}.{wd_host}.myworkdayjobs.com/{site}"
+    endpoint = f"https://{tenant}.{wd_host}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs"
+    results = []
+    page_size = 20
+    for page in range(10):
+        try:
+            response = SESSION.post(endpoint, json={"appliedFacets":{},"limit":page_size,"offset":page*page_size,"searchText":""},
+                                    headers={"Content-Type":"application/json"}, timeout=40)
+            if response.status_code != 200:
+                break
+            postings = response.json().get("jobPostings", [])
+        except Exception:
+            break
+        for raw in postings:
+            title = clean_text(raw.get("title"))
+            if not title_is_relevant(title):
+                continue
+            location = clean_text(raw.get("locationsText"))
+            workplace_type = raw.get("remoteType")
+            workplace = classify_workplace(location=location, workplace_type=workplace_type, structured_data=raw)
+            country = classify_country(location=location, workplace=workplace)
+            if not location_is_allowed(country, workplace):
+                continue
+            posted = parse_date(raw.get("postedOn"))
+            if not is_recent(posted):
+                continue
+            path = clean_text(raw.get("externalPath"))
+            link = f"{base}{path}" if path.startswith("/") else ""
+            job_id = re.sub(r"[^A-Za-z0-9_-]", "-", path.split("/")[-1])[-64:]
+            if link and job_id:
+                results.append({"ats":"workday","company":tenant,"job_id":job_id,"title":title,"location":location,"country":country,"workplace":workplace,"posted_date":posted,"job_url":link})
+        if len(postings) < page_size:
+            break
+    return results
+
+
+def fetch_keka(slug):
+    base = f"https://{slug}.keka.com/careers/"
+    html = request_text(base, timeout=30)
+    match = re.search(r"/ats/documents/([0-9a-f-]{36})/", html or "", re.I)
+    if not match:
+        return []
+    data = request_json(f"{base}api/embedjobs/default/active/{match.group(1)}", timeout=35)
+    if not isinstance(data, list):
+        return []
+    results = []
+    for raw in data:
+        title = clean_text(raw.get("title"))
+        if not title_is_relevant(title):
+            continue
+        places = raw.get("jobLocations") or []
+        place = places[0] if places else {}
+        location = ", ".join(clean_text(place.get(k)) for k in ("city","name","countryName") if clean_text(place.get(k)))
+        country = classify_country(location=location, country_code=clean_text(place.get("countryCode") or place.get("countryName")))
+        workplace = classify_workplace(location=location, structured_data=raw)
+        if not location_is_allowed(country, workplace):
+            continue
+        posted = parse_date(raw.get("publishedOn"))
+        if not is_recent(posted):
+            continue
+        job_id = clean_text(raw.get("id"))
+        link = f"{base}jobdetails/{job_id}" if job_id else ""
+        if link:
+            results.append({"ats":"keka","company":slug,"job_id":job_id,"title":title,"location":location,"country":country,"workplace":workplace,"posted_date":posted,"job_url":link})
+    return results
+
+
 FETCHERS = {
     "greenhouse": fetch_greenhouse,
     "ashby": fetch_ashby,
     "lever": fetch_lever,
     "workable": fetch_workable,
     "smartrecruiters": fetch_smartrecruiters,
+    "recruitee": fetch_recruitee,
+    "teamtailor": fetch_teamtailor,
+    "pinpoint": fetch_pinpoint,
+    "workday": fetch_workday,
+    "keka": fetch_keka,
 }
 
 
