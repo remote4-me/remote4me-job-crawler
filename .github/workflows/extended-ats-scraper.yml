@@ -1,0 +1,42 @@
+name: Remote4Me Extended ATS Collection
+
+on:
+  # Run after the existing crawler has refreshed the four shared output tabs.
+  workflow_run:
+    workflows: ["Remote4.me Job Crawler"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote4me-extended-ats
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests gspread google-auth
+
+      - name: Collect additional ATS jobs into existing tabs
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          PYTHONUNBUFFERED: "1"
+        run: python extended_ats_runner.py
