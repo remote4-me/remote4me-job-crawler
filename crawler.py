@@ -2844,7 +2844,7 @@ def discover_subdomain_boards_from_commoncrawl(ats, base_domain):
                             # tenant.wd5.myworkdayjobs.com/{locale}/{site}/...
                             segments = [x for x in parsed.path.split("/") if x]
                             site = segments[1] if segments and re.fullmatch(r"[a-z]{2}(-[a-z]{2})?", segments[0], re.I) and len(segments) > 1 else (segments[0] if segments else "")
-                            if len(labels) == 2 and re.fullmatch(r"wd\\d+", labels[1]) and site:
+                            if len(labels) == 2 and re.fullmatch(r"wd\d+", labels[1]) and site:
                                 slug = f"{labels[0]}/{labels[1]}/{site}"
                         elif ats == "teamtailor" and len(labels) == 2 and labels[1] == "na":
                             slug = ".".join(labels)
@@ -2870,7 +2870,7 @@ def is_valid_ats_slug(ats, slug):
         parts = str(slug).split("/")
         return len(parts) == 3 and all(re.fullmatch(r"[A-Za-z0-9_-]+", p or "") for p in parts)
     if ats == "teamtailor":
-        return bool(re.fullmatch(r"[a-z0-9_-]+(?:\\.na)?", str(slug), re.I))
+        return bool(re.fullmatch(r"[a-z0-9_-]+(?:\.na)?", str(slug), re.I))
     return bool(re.fullmatch(r"[A-Za-z0-9_-]+", str(slug)))
 
 
@@ -4541,7 +4541,7 @@ def fetch_teamtailor(slug):
             country_code = country_code or clean_text(address.get("addressCountry"))
         location = ", ".join(dict.fromkeys(location_parts))
         workplace = classify_workplace(location=location, workplace_type=jp.get("jobLocationType"), structured_data=jp)
-        if workplace == "unknown" and re.search(r"\\bremote\\b", title, re.I):
+        if workplace == "unknown" and re.search(r"\bremote\b", title, re.I):
             workplace = "remote"
         country = classify_country(location=location, country_code=country_code, description=clean_text(raw.get("content_html") or jp.get("description")), workplace=workplace)
         if not location_is_allowed(country, workplace):
