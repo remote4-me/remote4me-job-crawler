@@ -3,8 +3,9 @@ name: Remote4Me Ashby Support Jobs
 on:
   workflow_dispatch:
   schedule:
-    # Daily at 7:00 PM India Standard Time (13:30 UTC)
-    - cron: "30 13 * * *"
+    # Run after the existing 7:00 PM IST crawler has refreshed the Boards registry.
+    # 8:00 PM India Standard Time = 14:30 UTC.
+    - cron: "30 14 * * *"
 
 permissions:
   contents: read
@@ -40,12 +41,3 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: python ashby_runner.py
 
-      - name: Upload run log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ashby-run-log
-          path: |
-            *.log
-          if-no-files-found: ignore
-          retention-days: 7
