@@ -1,8 +1,7 @@
-name: Remote4Me Ashby Support Jobs
+name: Remote4Me Extended ATS Collection
 
 on:
-  # Run automatically after the existing daily crawler finishes. This ensures
-  # its Boards registry has been refreshed before this Ashby-only pass starts.
+  # Run after the existing crawler has refreshed the four shared output tabs.
   workflow_run:
     workflows: ["Remote4.me Job Crawler"]
     types: [completed]
@@ -13,15 +12,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: remote4me-ashby-scraper
+  group: remote4me-extended-ats
   cancel-in-progress: false
 
 jobs:
-  ashby:
-    # Do not run on a failed/cancelled parent crawl. Manual runs remain available.
+  collect:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,10 +34,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests gspread google-auth
 
-      - name: Run Ashby-only scraper
+      - name: Collect additional ATS jobs into existing tabs
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          ASHBY_SEED_SLUGS: ${{ vars.ASHBY_SEED_SLUGS }}
           PYTHONUNBUFFERED: "1"
-        run: python ashby_runner.py
+        run: python extended_ats_runner.py
